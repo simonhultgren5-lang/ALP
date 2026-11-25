@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Cinzel', Georgia, serif;
+    --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: #0B0B0F;
+    color: #E6E4DD;
+    font-family: var(--font-sans);
+    user-select: none;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom thin dark scrollbar inside drawers */
+.ae-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.ae-scroll::-webkit-scrollbar-track {
+  background: #0B0B0F;
+}
+.ae-scroll::-webkit-scrollbar-thumb {
+  background: #272733;
+  border-radius: 3px;
+}
+.ae-scroll::-webkit-scrollbar-thumb:hover {
+  background: #3F3F52;
+}

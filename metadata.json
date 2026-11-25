@@ -1,0 +1,6 @@
+{
+  "name": "Ashen Eclipse",
+  "description": "A dark fantasy top-down Action RPG built around Skills, Aspects, Marks, and procedural Domain progression.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
