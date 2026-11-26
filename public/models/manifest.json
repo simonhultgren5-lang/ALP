@@ -1,15 +1,16 @@
 {
   "models": {
-    "player": "/models/knight.glb",
+    "player": "/models/ashen_knight.glb",
     "boss": "/models/skeleton_warrior.glb",
     "thrall": "/models/skeleton_minion.glb",
     "cultist": "/models/skeleton_mage.glb",
     "charger": "/models/barbarian.glb",
-    "stalker": "/models/skeleton_rogue.glb"
+    "stalker": "/models/skeleton_rogue.glb",
+    "dummy": "/models/sanctuary_target_dummy.glb"
   },
   "props": {
-    "pillar": "/models/pillar_decorated.glb",
-    "torch": "/models/torch_lit.glb",
-    "wall": "/models/wall_arched.glb"
+    "pillar": "/models/ember_pillar.glb",
+    "torch": "/models/iron_brazier.glb",
+    "wall": "/models/ruined_arch.glb"
   }
 }
