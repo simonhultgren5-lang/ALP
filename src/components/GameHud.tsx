@@ -20,7 +20,7 @@ interface GameHudProps {
   onResetSanctuary: () => void;
 }
 
-const KEY_LABELS = ['1', '2', '3', '4', 'Space'];
+const KEY_LABELS = ['RMB', '2', '3', '4', 'Space'];
 
 export function GameHud({
   hud,
@@ -96,18 +96,31 @@ export function GameHud({
               Sanctuary Practice Arena · Open Build [I] to Swap Skills &amp; Aspects Live
             </div>
           ) : hud.bossActive ? (
-            <div className="w-full max-w-md bg-[#17171F]/95 border border-[#272733] rounded-lg px-4 py-2.5">
+            <div
+              className={`w-full max-w-md bg-[#17171F]/95 border rounded-lg px-4 py-2.5 ${
+                hud.bossPhase === 2 ? 'border-[#DC2626]' : 'border-[#272733]'
+              }`}
+            >
               <div className="flex items-center justify-between text-xs mb-1.5">
-                <span className="font-display font-semibold text-[#F8FAFC] tracking-wide">
-                  {hud.bossName}
-                </span>
-                <span className="font-mono-tabular text-[#D99B38]">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-display font-semibold text-[#F8FAFC] tracking-wide truncate">
+                    {hud.bossName}
+                  </span>
+                  {hud.bossPhase === 2 && (
+                    <span className="px-1.5 py-0.5 rounded bg-[#DC2626]/20 border border-[#DC2626] font-mono-tabular text-[10px] font-bold text-[#FCA5A5] shrink-0">
+                      PHASE II
+                    </span>
+                  )}
+                </div>
+                <span className="font-mono-tabular text-[#D99B38] shrink-0">
                   {hud.bossHp} / {hud.bossMaxHp}
                 </span>
               </div>
               <div className="h-2.5 w-full bg-[#0B0B0F] rounded overflow-hidden border border-[#272733]">
                 <div
-                  className="h-full bg-[#DC2626] transition-[width] duration-75"
+                  className={`h-full transition-[width] duration-75 ${
+                    hud.bossPhase === 2 ? 'bg-[#EF4444]' : 'bg-[#DC2626]'
+                  }`}
                   style={{ width: `${Math.max(0, Math.min(100, (hud.bossHp / Math.max(1, hud.bossMaxHp)) * 100))}%` }}
                 />
               </div>
@@ -388,6 +401,9 @@ export function GameHud({
                   style={{ opacity: Math.max(0.15, esPct / 100) }}
                 />
               )}
+              {hud.veilShield > 0 && (
+                <div className="absolute inset-1 rounded-full border-2 border-[#22D3EE] pointer-events-none" />
+              )}
               <div className="relative z-10 h-full flex flex-col items-center justify-center text-center leading-tight">
                 <span className="font-mono-tabular text-xs font-bold text-[#F8FAFC] drop-shadow">
                   {hud.hp}
@@ -395,6 +411,11 @@ export function GameHud({
                 {hud.es > 0 && (
                   <span className="font-mono-tabular text-[10px] font-semibold text-[#7DD3FC]">
                     +{hud.es} ES
+                  </span>
+                )}
+                {hud.veilShield > 0 && (
+                  <span className="font-mono-tabular text-[9px] font-semibold text-[#22D3EE]">
+                    +{hud.veilShield} Veil
                   </span>
                 )}
               </div>

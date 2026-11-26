@@ -12,7 +12,15 @@ export type SkillId =
   | 'bone_spear'
   | 'seismic_slam'
   | 'void_tendrils'
-  | 'radiant_barrier';
+  | 'radiant_barrier'
+  | 'crimson_whirlwind'
+  | 'arcane_orb'
+  | 'glacial_cascade'
+  | 'rift_blade'
+  | 'soul_harvest'
+  | 'meteor_brand'
+  | 'tempest_nova'
+  | 'bulwark_charge';
 
 export type UpgradeBranch = 'A' | 'B' | 'C';
 export type UpgradeTier = 5 | 10 | 15;
@@ -61,7 +69,17 @@ export type AspectId =
   | 'shade'
   | 'siphon'
   | 'eclipse'
-  | 'frigid';
+  | 'frigid'
+  | 'berserk'
+  | 'pyromancer'
+  | 'frostbite'
+  | 'arcane_surge'
+  | 'glass_cannon'
+  | 'bastion'
+  | 'evasion_master'
+  | 'immortal_ward'
+  | 'chronomancer'
+  | 'harvester';
 
 export type AspectCategory = 'offense' | 'defense' | 'utility';
 
@@ -146,6 +164,7 @@ export interface DomainModifier {
   lootRarityBonus: number; // e.g. 0.35 = +35%
   xpBonus: number;
   burningGround?: boolean;
+  chillingGround?: boolean;
 }
 
 export interface ComputedPlayerStats {
@@ -178,6 +197,13 @@ export interface ComputedPlayerStats {
   extraChains: number;
   repeatChance: number;
   areaRepeatChance: number;
+  cooldownRecoveryMult: number;
+  esRechargeMult: number;
+  burnMagnitudeMult: number;
+  killLifeGain: number;
+  killManaGain: number;
+  manaCostMult: number;
+  physicalDamageTakenMult: number;
   activeMarks: MarkId[];
   activeLegendaries: string[];
 }
@@ -192,6 +218,8 @@ export interface DamageCalculationInput {
   isDistantTarget: boolean;     // Hunter Aspect
   isLowLife: boolean;           // Life <= 35% or Low Life Covenant
   isCrit: boolean;
+  isTargetChilled?: boolean;    // Frostbite Aspect
+  isHighMana?: boolean;         // Arcane Surge Aspect (>= 60% Mana)
   enemyResistPct: number;       // 0..75
   enemyArmour: number;
 }
@@ -261,6 +289,7 @@ export interface HudSnapshot {
   bossName: string;
   bossHp: number;
   bossMaxHp: number;
+  bossPhase: 1 | 2;
   eclipseReady: boolean;
   eclipseTimer: number;
   shadeReady: boolean;

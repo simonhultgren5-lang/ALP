@@ -121,7 +121,7 @@ export function TitleScreen({
       {/* Single Flat Borderless Control Hint */}
       <footer className="relative z-10 px-8 md:px-16 lg:px-24 pb-6">
         <p className="text-xs text-[#94A3B8] font-mono-tabular">
-          WASD Move · Mouse Aim / LMB Primary · 1–4 &amp; Space Skills · Q Flask · I Build · P Pause
+          LMB Move / Interact · RMB Primary · Shift+LMB Stand Attack · 1–4 &amp; Space Skills · Q Flask · WASD Optional · P Pause
         </p>
       </footer>
     </div>

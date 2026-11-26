@@ -77,6 +77,29 @@ export function aggregateGearStats(
     evasion = 0;
   }
 
+  // Bastion Aspect: +35% Armour & +15% All Elemental Resistances, -10% Move Speed
+  if (hasAspect('bastion')) {
+    armour = Math.round(armour * 1.35);
+    fireRes += 15;
+    coldRes += 15;
+    lightningRes += 15;
+    movementSpeedPct -= 10;
+  }
+
+  // Phantom (evasion_master) Aspect: +60% more Evasion & +12% Move Speed, -25% Armour
+  if (hasAspect('evasion_master')) {
+    if (canEvade) {
+      evasion = Math.round(evasion * 1.6);
+    }
+    movementSpeedPct += 12;
+    armour = Math.round(armour * 0.75);
+  }
+
+  // Pyromancer Aspect: -15% Cold Res
+  if (hasAspect('pyromancer')) {
+    coldRes -= 15;
+  }
+
   // Iron Vow Plate legendary: Iron Aspect grants 8% of Armour as Max Life
   if (hasAspect('iron') && hasLeg('iron_vow_plate')) {
     maxLife += Math.round(armour * 0.08);
@@ -86,6 +109,17 @@ export function aggregateGearStats(
   if (hasAspect('aether')) {
     maxEnergyShield = Math.round(maxEnergyShield * 1.45);
     maxLife = Math.round(maxLife * 0.8);
+  }
+
+  // Glass Cannon Aspect: 25% less Max Life & ES
+  if (hasAspect('glass_cannon')) {
+    maxLife = Math.round(maxLife * 0.75);
+    maxEnergyShield = Math.round(maxEnergyShield * 0.75);
+  }
+
+  // Chronomancer Aspect: -15% Max Life
+  if (hasAspect('chronomancer')) {
+    maxLife = Math.round(maxLife * 0.85);
   }
 
   // Aether Overflow Mark: 10% of Max ES added as flat damage
@@ -98,8 +132,16 @@ export function aggregateGearStats(
     critMultiplierPct += 50;
   }
 
+  // Frostbite & Harvester action speed / crit chance modifiers
+  if (hasAspect('frostbite')) {
+    attackCastSpeedPct -= 12;
+  }
+
   // Storm Aspect: -15% less Crit Chance, +2 chains
   let critChance = Math.max(0.02, 0.06 + critChancePct / 100);
+  if (hasAspect('harvester')) {
+    critChance = Math.max(0.02, critChance - 0.1);
+  }
   if (hasAspect('storm')) {
     critChance *= 0.85;
   }
@@ -154,7 +196,10 @@ export function aggregateGearStats(
     critChance: Math.min(0.85, critChance),
     critMultiplier: critMultiplierPct / 100,
     actionSpeedMult: Math.max(0.65, 1 + attackCastSpeedPct / 100),
-    areaMult: (hasAspect('earthquake') ? 1.3 : 1.0) * (hasAspect('hunter') ? 0.9 : 1.0),
+    areaMult:
+      (hasAspect('earthquake') ? 1.3 : 1.0) *
+      (hasAspect('hunter') ? 0.9 : 1.0) *
+      (hasAspect('pyromancer') ? 1.2 : 1.0),
     movementSpeed: Math.max(150, Math.round(235 * (1 + movementSpeedPct / 100))),
     lifeLeechRate,
     lifeCostsSkills: hasAspect('blood'),
@@ -166,12 +211,19 @@ export function aggregateGearStats(
     veilShieldMax: hasAspect('veil') ? Math.round(maxLife * 0.22 + 40) : 0,
     veilCooldown: 7,
     regrowthPctPerSec: hasAspect('regrowth') ? 0.0075 : 0, // 3% over 4s
-    flaskRecoveryMult: hasAspect('regrowth') ? 0.8 : 1.0,
+    flaskRecoveryMult: (hasAspect('regrowth') ? 0.8 : 1.0) * (hasAspect('immortal_ward') ? 0.8 : 1.0),
     fireDamageTakenMult: hasAspect('cinder') ? 1.12 : 1.0,
     skillLevelBonus,
     extraChains,
     repeatChance: Math.min(0.6, repeatChance),
     areaRepeatChance,
+    cooldownRecoveryMult: hasAspect('chronomancer') ? 0.8 : 1.0,
+    esRechargeMult: hasAspect('immortal_ward') ? 1.4 : 1.0,
+    burnMagnitudeMult: hasAspect('pyromancer') ? 1.5 : 1.0,
+    killLifeGain: hasAspect('harvester') ? 8 : 0,
+    killManaGain: hasAspect('harvester') ? 8 : 0,
+    manaCostMult: hasAspect('arcane_surge') ? 1.25 : 1.0,
+    physicalDamageTakenMult: hasAspect('berserk') ? 1.1 : 1.0,
     activeMarks,
     activeLegendaries,
   };
@@ -236,6 +288,21 @@ export function calculateSkillDamage(input: DamageCalculationInput): DamageCalcu
     // Precision drawback: Non-critical hits deal 20% less damage
     moreMultipliersApplied.push(0.8);
   }
+  if (hasAspect('berserk') && input.isLowLife && skill.tags.includes('melee')) {
+    moreMultipliersApplied.push(1.25);
+  }
+  if (hasAspect('frostbite') && skill.damageType === 'cold' && input.isTargetChilled) {
+    moreMultipliersApplied.push(1.35);
+  }
+  if (hasAspect('arcane_surge') && skill.tags.includes('spell') && (input.isHighMana ?? true)) {
+    moreMultipliersApplied.push(1.3);
+  }
+  if (hasAspect('glass_cannon')) {
+    moreMultipliersApplied.push(1.45);
+  }
+  if (hasAspect('harvester') && (skill.damageType === 'chaos' || skill.tags.includes('dot'))) {
+    moreMultipliersApplied.push(1.25);
+  }
 
   // Skill Lv 5/10/15 Multiplicative Upgrades
   if (skill.id === 'cinder_slash' && c15 === 'A' && input.isLowLife) {
@@ -259,6 +326,34 @@ export function calculateSkillDamage(input: DamageCalculationInput): DamageCalcu
   if (skill.id === 'void_tendrils' && c5 === 'B') {
     moreMultipliersApplied.push(1.3);
   }
+  if (skill.id === 'crimson_whirlwind') {
+    if (c5 === 'A') moreMultipliersApplied.push(1.25);
+    if (c15 === 'A' && input.isLowLife) moreMultipliersApplied.push(1.4);
+  }
+  if (skill.id === 'arcane_orb' && c5 === 'A') {
+    moreMultipliersApplied.push(1.25);
+  }
+  if (skill.id === 'glacial_cascade') {
+    if (c5 === 'A') moreMultipliersApplied.push(1.25);
+    if (c15 === 'A' && input.isTargetChilled) moreMultipliersApplied.push(1.35);
+  }
+  if (skill.id === 'rift_blade' && c5 === 'A') {
+    moreMultipliersApplied.push(1.3);
+  }
+  if (skill.id === 'soul_harvest') {
+    if (c5 === 'A') moreMultipliersApplied.push(1.3);
+    if (c15 === 'A' && input.isTargetChilled) moreMultipliersApplied.push(1.45);
+  }
+  if (skill.id === 'meteor_brand') {
+    if (c5 === 'A') moreMultipliersApplied.push(1.3);
+    if (c15 === 'A') moreMultipliersApplied.push(1.45);
+  }
+  if (skill.id === 'tempest_nova' && c5 === 'A') {
+    moreMultipliersApplied.push(1.25);
+  }
+  if (skill.id === 'bulwark_charge' && c5 === 'A') {
+    moreMultipliersApplied.push(1.35);
+  }
 
   let afterMore = afterIncreased;
   for (const mult of moreMultipliersApplied) {
@@ -269,6 +364,9 @@ export function calculateSkillDamage(input: DamageCalculationInput): DamageCalcu
   let effectiveCritMult = stats.critMultiplier;
   if (skill.id === 'cinder_slash' && c10 === 'A') effectiveCritMult += 0.25;
   if (skill.id === 'frost_lance' && c5 === 'B') effectiveCritMult += 0.3;
+  if (skill.id === 'arcane_orb' && c15 === 'A') effectiveCritMult += 0.35;
+  if (skill.id === 'meteor_brand' && c10 === 'A') effectiveCritMult += 0.3;
+  if (skill.id === 'tempest_nova' && c15 === 'A') effectiveCritMult += 0.35;
 
   const afterCrit = input.isCrit ? afterMore * effectiveCritMult : afterMore;
 
@@ -313,6 +411,7 @@ export function computeIncomingDamageMitigation(
     if (stats.activeMarks.includes('fortress_heart') && !stats.canEvade) {
       dmg *= 0.88; // Extra 12% physical DR
     }
+    dmg *= stats.physicalDamageTakenMult;
   } else {
     const res =
       damageType === 'fire'

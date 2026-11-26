@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { BenchCraftAction } from '../game/combatMath';
 import {
   ALL_ASPECT_IDS,
@@ -10,6 +10,11 @@ import {
   RARITY_COLORS,
   SKILLS,
 } from '../game/data';
+import {
+  CustomModelStatus,
+  MODEL_SLOT_META,
+  ModelSlotId,
+} from '../game/threeModelLoader';
 import {
   AspectId,
   ComputedPlayerStats,
@@ -46,9 +51,15 @@ interface BuildDrawerProps {
   onToggleCorrupted: () => void;
   onLaunchDomain: () => void;
   onEnterSanctuary: () => void;
+  onExportSave: () => void;
+  onImportSave: (rawJson: string) => { ok: boolean; error?: string };
+  customModels: CustomModelStatus[];
+  onUploadCustomModel: (slot: ModelSlotId, file: File) => Promise<void>;
+  onClearCustomModel: (slot: ModelSlotId) => void;
+  onExportStarterKnightGlb: () => Promise<void>;
 }
 
-type DrawerTab = 'skills' | 'aspects' | 'gear' | 'domain';
+type DrawerTab = 'skills' | 'aspects' | 'gear' | 'domain' | 'models';
 
 export function BuildDrawer({
   open,
@@ -76,12 +87,52 @@ export function BuildDrawer({
   onToggleCorrupted,
   onLaunchDomain,
   onEnterSanctuary,
+  onExportSave,
+  onImportSave,
+  customModels,
+  onUploadCustomModel,
+  onClearCustomModel,
+  onExportStarterKnightGlb,
 }: BuildDrawerProps) {
   const [tab, setTab] = useState<DrawerTab>('skills');
   const [selectedSlotIdx, setSelectedSlotIdx] = useState(0);
   const [craftSlot, setCraftSlot] = useState<EquipSlot>('weapon');
+  const [saveNotice, setSaveNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  const [modelBusySlot, setModelBusySlot] = useState<ModelSlotId | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const modelUploadSlotRef = useRef<ModelSlotId>('player');
+  const modelFileInputRef = useRef<HTMLInputElement | null>(null);
 
   if (!open) return null;
+
+  const handleModelFilePicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const slot = modelUploadSlotRef.current;
+    setModelBusySlot(slot);
+    try {
+      await onUploadCustomModel(slot, file);
+    } finally {
+      setModelBusySlot(null);
+    }
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = onImportSave(text);
+      setSaveNotice({
+        ok: res.ok,
+        text: res.ok ? 'Save imported.' : res.error || 'Import failed.',
+      });
+    } catch {
+      setSaveNotice({ ok: false, text: 'Could not read save file.' });
+    }
+  };
 
   const equippedSlots = Object.keys(EQUIP_SLOT_LABELS) as EquipSlot[];
   const craftItem = equipment[craftSlot];
@@ -102,6 +153,7 @@ export function BuildDrawer({
                   ['aspects', 'Aspects'],
                   ['gear', 'Gear & Bench'],
                   ['domain', 'Domain Portal'],
+                  ['models', '3D Models (.GLB)'],
                 ] as const
               ).map(([id, label]) => (
                 <button
@@ -120,13 +172,45 @@ export function BuildDrawer({
             </nav>
           </div>
 
-          <button
-            type="button"
-            onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-[#0B0B0F] hover:bg-[#232330] border border-[#272733] text-xs font-medium text-[#E6E4DD] cursor-pointer"
-          >
-            Close [I]
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {saveNotice && (
+              <span
+                className={`text-[11px] font-mono-tabular ${
+                  saveNotice.ok ? 'text-[#10B981]' : 'text-[#F87171]'
+                }`}
+              >
+                {saveNotice.text}
+              </span>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportFile}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={onExportSave}
+              className="px-3 py-1.5 rounded-lg bg-[#0B0B0F] hover:bg-[#232330] border border-[#272733] text-xs font-medium text-[#CBD5E1] cursor-pointer whitespace-nowrap"
+            >
+              Export Save
+            </button>
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="px-3 py-1.5 rounded-lg bg-[#0B0B0F] hover:bg-[#232330] border border-[#272733] text-xs font-medium text-[#CBD5E1] cursor-pointer whitespace-nowrap"
+            >
+              Import Save
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-1.5 rounded-lg bg-[#0B0B0F] hover:bg-[#232330] border border-[#272733] text-xs font-medium text-[#E6E4DD] cursor-pointer whitespace-nowrap"
+            >
+              Close [I]
+            </button>
+          </div>
         </div>
 
         {/* Stat Strip */}
@@ -560,6 +644,124 @@ export function BuildDrawer({
                     Open Tier {selectedDomainTier} Domain
                   </button>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {tab === 'models' && (
+            <div className="space-y-4">
+              <input
+                ref={modelFileInputRef}
+                type="file"
+                accept=".glb,.gltf"
+                onChange={handleModelFilePicked}
+                className="hidden"
+              />
+              <div className="flex flex-wrap items-center justify-between gap-4 p-4 rounded-lg bg-[#0B0B0F] border border-[#272733]">
+                <div className="space-y-1 max-w-2xl">
+                  <h3 className="text-sm font-semibold text-[#F8FAFC]">
+                    Custom .GLB / .GLTF Rigs &amp; AnimationMixer
+                  </h3>
+                  <p className="text-xs text-[#94A3B8] leading-relaxed">
+                    Upload or drag any rigged <code className="text-[#CBD5E1]">.glb</code> model onto a slot below, or place files in{' '}
+                    <code className="text-[#CBD5E1]">public/models/</code> and register them in{' '}
+                    <code className="text-[#CBD5E1]">public/models/manifest.json</code>. Bounds auto-scale to arena height and clips named{' '}
+                    <span className="text-[#E2E8F0]">Idle, Walk/Run, Attack/Slash, Windup, Death</span> bind automatically.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void onExportStarterKnightGlb()}
+                  className="px-3.5 py-2 rounded-lg bg-[#232330] hover:bg-[#2F2F40] border border-[#D99B38]/50 text-xs font-medium text-[#FDE68A] cursor-pointer whitespace-nowrap"
+                >
+                  Export Starter Knight (.glb)
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {customModels.map((item) => {
+                  const meta = MODEL_SLOT_META[item.slot];
+                  const isBusy = modelBusySlot === item.slot;
+                  return (
+                    <div
+                      key={item.slot}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const dropped = e.dataTransfer.files?.[0];
+                        if (!dropped) return;
+                        setModelBusySlot(item.slot);
+                        void onUploadCustomModel(item.slot, dropped).finally(() =>
+                          setModelBusySlot(null)
+                        );
+                      }}
+                      className={`p-4 rounded-lg border flex flex-col justify-between gap-3 transition-colors ${
+                        item.active
+                          ? 'bg-[#1D1B16] border-[#D99B38]'
+                          : 'bg-[#0B0B0F] border-[#272733]'
+                      }`}
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-semibold text-[#F8FAFC]">
+                            {meta.label}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono-tabular border ${
+                              item.active
+                                ? 'bg-[#D99B38]/15 border-[#D99B38]/50 text-[#FDE68A]'
+                                : 'bg-[#17171F] border-[#272733] text-[#94A3B8]'
+                            }`}
+                          >
+                            {item.active ? 'Custom .GLB' : 'Procedural'}
+                          </span>
+                        </div>
+                        <p className="text-xs text-[#94A3B8]">{meta.description}</p>
+                        {item.active && (
+                          <div className="pt-1 text-[11px] font-mono-tabular text-[#CBD5E1] space-y-0.5">
+                            <div>
+                              File: <span className="text-[#FDE68A]">{item.sourceName}</span> ({item.triangleCount.toLocaleString()} tris)
+                            </div>
+                            <div className="text-[#94A3B8] truncate">
+                              Clips:{' '}
+                              {item.clipNames.length > 0
+                                ? `${item.clipNames.length} (${item.clipNames.slice(0, 4).join(', ')}${item.clipNames.length > 4 ? ', ...' : ''})`
+                                : 'None (static mesh)'}
+                            </div>
+                          </div>
+                        )}
+                        {item.error && (
+                          <div className="text-[11px] text-[#F87171] pt-1">
+                            {item.error}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2 pt-1">
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => {
+                            modelUploadSlotRef.current = item.slot;
+                            modelFileInputRef.current?.click();
+                          }}
+                          className="px-3 py-1.5 rounded bg-[#17171F] hover:bg-[#232330] border border-[#3F3F52] text-xs font-medium text-[#E6E4DD] cursor-pointer disabled:opacity-50"
+                        >
+                          {isBusy ? 'Loading...' : 'Upload / Drop .GLB'}
+                        </button>
+                        {item.active && (
+                          <button
+                            type="button"
+                            onClick={() => onClearCustomModel(item.slot)}
+                            className="px-3 py-1.5 rounded bg-[#17171F] hover:bg-[#2B171B] border border-[#272733] text-xs font-medium text-[#FCA5A5] cursor-pointer"
+                          >
+                            Revert
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

@@ -87,6 +87,17 @@ interface LightningBoltEffect {
   maxLife: number;
 }
 
+interface CritStreak {
+  active: boolean;
+  x: number;
+  y: number;
+  width: number;
+  color: string;
+  life: number;
+  maxLife: number;
+  chromatic: boolean;
+}
+
 interface Projectile {
   active: boolean;
   fromPlayer: boolean;
@@ -142,6 +153,7 @@ interface Enemy {
   aimAngle: number;
   orbitDir: number;
   bossAttackIndex: number;
+  bossPhase?: 1 | 2;
   scaleX: number;
   scaleY: number;
   isDummy?: boolean;
@@ -168,12 +180,20 @@ export interface EngineCallbacks {
 const PARTICLE_POOL_SIZE = 480;
 const DECAL_POOL_SIZE = 100;
 const FLOATING_TEXT_POOL_SIZE = 80;
+const CRIT_STREAK_POOL_SIZE = 24;
 const MAX_CONCURRENT_ATTACKERS = 4;
 
+export interface AshenEngineOptions {
+  headless?: boolean;
+  screenToWorldOverride?: (clientX: number, clientY: number) => { x: number; y: number };
+}
+
 export class AshenEngine {
-  private canvas: HTMLCanvasElement;
-  private ctx: CanvasRenderingContext2D;
+  private canvas: HTMLCanvasElement | null;
+  private ctx: CanvasRenderingContext2D | null;
   private callbacks: EngineCallbacks;
+  private headless: boolean;
+  private screenToWorldOverride?: (clientX: number, clientY: number) => { x: number; y: number };
 
   private rafId: number | null = null;
   private lastTime = 0;
@@ -183,12 +203,23 @@ export class AshenEngine {
   private hudSyncTimer = 0;
   private needsStaticRedraw = true;
 
-  // Input state
+  // Input state (Diablo / PoE Click-to-Move + RMB Skill + Hybrid WASD)
   private keys = new Set<string>();
   private mouseScreenX = 0;
   private mouseScreenY = 0;
-  private mouseDown = false;
+  private leftMouseDown = false;
+  private rightMouseDown = false;
   private pointerInitialized = false;
+  private moveTargetActive = false;
+  private moveTargetX = 0;
+  private moveTargetY = 0;
+  private moveTargetKind: 'move' | 'attack' | 'interact' = 'move';
+  private targetEnemyId: number | null = null;
+  private targetLootId: string | null = null;
+  private targetPortal = false;
+  private stuckMoveTimer = 0;
+  private lastStepPx = 0;
+  private lastStepPy = 0;
 
   // Game & Build State
   public phase: GamePhase = 'title';
@@ -294,6 +325,8 @@ export class AshenEngine {
   private decalCursor = 0;
   private floatingTexts: FloatingText[];
   private textCursor = 0;
+  private critStreaks: CritStreak[];
+  private critStreakCursor = 0;
 
   // Camera
   private camX = 0;
@@ -303,14 +336,21 @@ export class AshenEngine {
   private weaponTrail: Array<{ x: number; y: number; life: number; color: string }> = [];
 
   constructor(
-    canvas: HTMLCanvasElement,
+    canvas: HTMLCanvasElement | null,
     initialSkillProgress: Record<SkillId, SkillProgress>,
-    callbacks: EngineCallbacks
+    callbacks: EngineCallbacks,
+    options?: AshenEngineOptions
   ) {
     this.canvas = canvas;
-    const context = canvas.getContext('2d');
-    if (!context) throw new Error('Canvas2D unsupported');
-    this.ctx = context;
+    this.headless = Boolean(options?.headless || !canvas);
+    this.screenToWorldOverride = options?.screenToWorldOverride;
+    if (canvas && !this.headless) {
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Canvas2D unsupported');
+      this.ctx = context;
+    } else {
+      this.ctx = null;
+    }
     this.callbacks = callbacks;
     this.skillProgress = initialSkillProgress;
     this.stats = aggregateGearStats(this.equipment, this.activeAspects, this.pLevel);
@@ -352,8 +392,21 @@ export class AshenEngine {
       maxLife: 0.7,
     }));
 
+    this.critStreaks = Array.from({ length: CRIT_STREAK_POOL_SIZE }, () => ({
+      active: false,
+      x: 0,
+      y: 0,
+      width: 90,
+      color: '#D99B38',
+      life: 0,
+      maxLife: 0.22,
+      chromatic: false,
+    }));
+
     this.bindEvents();
-    this.resizeCanvas();
+    if (!this.headless) {
+      this.resizeCanvas();
+    }
   }
 
   private handleKeyDown = (e: KeyboardEvent) => {
@@ -386,43 +439,170 @@ export class AshenEngine {
   };
 
   private handleMouseDown = (e: MouseEvent) => {
-    if (e.button !== 0 || this.phase !== 'playing') return;
-    this.mouseScreenX = e.clientX;
-    this.mouseScreenY = e.clientY;
-    this.pointerInitialized = true;
-    this.mouseDown = true;
+    this.handleExternalPointerDown(e.clientX, e.clientY, e.button);
+  };
 
-    // Check if clicking ground loot directly
-    const world = this.screenToWorld(e.clientX, e.clientY);
+  private handleContextMenu = (e: MouseEvent) => {
+    if (this.phase === 'playing') {
+      e.preventDefault();
+    }
+  };
+
+  public handleExternalPointerDown(clientX: number, clientY: number, button = 0) {
+    if (this.phase !== 'playing') return;
+    this.mouseScreenX = clientX;
+    this.mouseScreenY = clientY;
+    this.pointerInitialized = true;
+
+    const world = this.screenToWorld(clientX, clientY);
+    const room = this.domain.rooms[this.currentRoomIdx];
+
+    // RMB: Cast Primary Skill (Slot 0) directly at cursor (Diablo / PoE signature skill)
+    if (button === 2) {
+      this.rightMouseDown = true;
+      this.moveTargetActive = false;
+      this.targetEnemyId = null;
+      this.targetLootId = null;
+      this.targetPortal = false;
+      this.pAimAngle = Math.atan2(world.y - this.py, world.x - this.px);
+      this.tryCastSlot(0);
+      return;
+    }
+
+    if (button !== 0) return;
+    this.leftMouseDown = true;
+
+    // Shift + LMB: Force Stand-Still Attack toward cursor
+    if (this.keys.has('ShiftLeft') || this.keys.has('ShiftRight')) {
+      this.moveTargetActive = false;
+      this.targetEnemyId = null;
+      this.targetLootId = null;
+      this.targetPortal = false;
+      this.pAimAngle = Math.atan2(world.y - this.py, world.x - this.px);
+      this.tryCastSlot(0);
+      return;
+    }
+
+    // 1. Click Ground Loot: collect immediately if close, else run to it
     for (let i = 0; i < this.groundLoot.length; i++) {
       const g = this.groundLoot[i];
-      if (Math.hypot(g.x - world.x, g.y - world.y) < 36) {
-        this.collectLoot(i);
+      if (Math.hypot(g.x - world.x, g.y - world.y) < 46) {
+        if (Math.hypot(g.x - this.px, g.y - this.py) < 82) {
+          this.collectLoot(i);
+          this.moveTargetActive = false;
+        } else {
+          this.targetLootId = g.id;
+          this.targetEnemyId = null;
+          this.targetPortal = false;
+          this.moveTargetX = g.x;
+          this.moveTargetY = g.y;
+          this.moveTargetKind = 'interact';
+          this.moveTargetActive = true;
+        }
         return;
       }
     }
-    this.tryCastSlot(0);
-  };
+
+    // 2. Click Active Portal: enter if close, else run to portal
+    if (
+      !this.inSanctuary &&
+      room.cleared &&
+      this.currentRoomIdx < this.domain.rooms.length - 1 &&
+      Math.hypot(world.x - room.portalX, world.y - room.portalY) < 76
+    ) {
+      if (Math.hypot(this.px - room.portalX, this.py - room.portalY) < 92) {
+        this.enterRoom(this.currentRoomIdx + 1);
+        soundEngine.playDash();
+        this.moveTargetActive = false;
+      } else {
+        this.targetPortal = true;
+        this.targetLootId = null;
+        this.targetEnemyId = null;
+        this.moveTargetX = room.portalX;
+        this.moveTargetY = room.portalY;
+        this.moveTargetKind = 'interact';
+        this.moveTargetActive = true;
+      }
+      return;
+    }
+
+    // 3. Click Enemy: attack-move / chase into skill reach & strike
+    let clickedEnemy: Enemy | null = null;
+    let bestDist = Infinity;
+    for (const e of this.enemies) {
+      if (e.koTimer > 0) continue;
+      const d = Math.hypot(e.x - world.x, e.y - world.y);
+      if (d <= e.radius + 30 && d < bestDist) {
+        bestDist = d;
+        clickedEnemy = e;
+      }
+    }
+    if (clickedEnemy) {
+      this.targetEnemyId = clickedEnemy.id;
+      this.targetLootId = null;
+      this.targetPortal = false;
+      const skill = SKILLS[this.hotbar[0]];
+      const reach =
+        skill.category === 'melee'
+          ? Math.max(96, skill.range * 0.88)
+          : Math.max(280, skill.range * 0.78);
+      if (Math.hypot(clickedEnemy.x - this.px, clickedEnemy.y - this.py) <= reach + clickedEnemy.radius) {
+        this.moveTargetActive = false;
+        this.pAimAngle = Math.atan2(clickedEnemy.y - this.py, clickedEnemy.x - this.px);
+        this.tryCastSlot(0);
+      } else {
+        this.moveTargetX = clickedEnemy.x;
+        this.moveTargetY = clickedEnemy.y;
+        this.moveTargetKind = 'attack';
+        this.moveTargetActive = true;
+      }
+      return;
+    }
+
+    // 4. Click Open Ground: set click-to-move waypoint
+    this.targetEnemyId = null;
+    this.targetLootId = null;
+    this.targetPortal = false;
+    this.moveTargetX = Math.max(36, Math.min(room.width - 36, world.x));
+    this.moveTargetY = Math.max(36, Math.min(room.height - 36, world.y));
+    this.moveTargetKind = 'move';
+    this.moveTargetActive = true;
+    this.stuckMoveTimer = 0;
+  }
+
+  public handleExternalPointerUp(button = 0) {
+    if (button === 0) this.leftMouseDown = false;
+    else if (button === 2) this.rightMouseDown = false;
+  }
+
+  public setExternalPointerMove(clientX: number, clientY: number) {
+    this.mouseScreenX = clientX;
+    this.mouseScreenY = clientY;
+    this.pointerInitialized = true;
+  }
 
   private handleMouseUp = (e: MouseEvent) => {
-    if (e.button === 0) this.mouseDown = false;
+    this.handleExternalPointerUp(e.button);
   };
 
   private handleBlur = () => {
     this.keys.clear();
-    this.mouseDown = false;
+    this.leftMouseDown = false;
+    this.rightMouseDown = false;
   };
 
   private handleVisibility = () => {
     if (document.hidden) {
       this.keys.clear();
-      this.mouseDown = false;
+      this.leftMouseDown = false;
+      this.rightMouseDown = false;
     }
   };
 
   private resizeObserver: ResizeObserver | null = null;
 
   private resizeCanvas = () => {
+    if (!this.canvas || !this.ctx) return;
     const parent = this.canvas.parentElement;
     const w = parent ? parent.clientWidth : window.innerWidth;
     const h = parent ? parent.clientHeight : window.innerHeight;
@@ -437,15 +617,20 @@ export class AshenEngine {
     window.addEventListener('keydown', this.handleKeyDown);
     window.addEventListener('keyup', this.handleKeyUp);
     window.addEventListener('mousemove', this.handleMouseMove);
-    this.canvas.addEventListener('mousedown', this.handleMouseDown);
+    if (this.canvas && !this.headless) {
+      this.canvas.addEventListener('mousedown', this.handleMouseDown);
+      this.canvas.addEventListener('contextmenu', this.handleContextMenu);
+    }
     window.addEventListener('mouseup', this.handleMouseUp);
     window.addEventListener('blur', this.handleBlur);
     document.addEventListener('visibilitychange', this.handleVisibility);
-    if (typeof ResizeObserver !== 'undefined' && this.canvas.parentElement) {
+    if (typeof ResizeObserver !== 'undefined' && this.canvas?.parentElement && !this.headless) {
       this.resizeObserver = new ResizeObserver(this.resizeCanvas);
       this.resizeObserver.observe(this.canvas.parentElement);
     }
-    window.addEventListener('resize', this.resizeCanvas);
+    if (!this.headless) {
+      window.addEventListener('resize', this.resizeCanvas);
+    }
   }
 
   public destroy() {
@@ -453,7 +638,8 @@ export class AshenEngine {
     window.removeEventListener('keydown', this.handleKeyDown);
     window.removeEventListener('keyup', this.handleKeyUp);
     window.removeEventListener('mousemove', this.handleMouseMove);
-    this.canvas.removeEventListener('mousedown', this.handleMouseDown);
+    this.canvas?.removeEventListener('mousedown', this.handleMouseDown);
+    this.canvas?.removeEventListener('contextmenu', this.handleContextMenu);
     window.removeEventListener('mouseup', this.handleMouseUp);
     window.removeEventListener('blur', this.handleBlur);
     document.removeEventListener('visibilitychange', this.handleVisibility);
@@ -462,6 +648,10 @@ export class AshenEngine {
   }
 
   public screenToWorld(clientX: number, clientY: number): { x: number; y: number } {
+    if (this.screenToWorldOverride) {
+      return this.screenToWorldOverride(clientX, clientY);
+    }
+    if (!this.canvas) return { x: this.px, y: this.py };
     const rect = this.canvas.getBoundingClientRect();
     const sx = clientX - rect.left;
     const sy = clientY - rect.top;
@@ -471,8 +661,12 @@ export class AshenEngine {
     };
   }
 
+  public stepSimulation(dt: number) {
+    this.update(dt);
+  }
+
   public startLoop() {
-    if (this.rafId !== null) return;
+    if (this.headless || this.rafId !== null) return;
     this.lastTime = performance.now();
     const tick = (now: number) => {
       const rawDt = (now - this.lastTime) / 1000;
@@ -515,7 +709,12 @@ export class AshenEngine {
     this.needsStaticRedraw = true;
     if (nextPhase !== 'playing') {
       this.keys.clear();
-      this.mouseDown = false;
+      this.leftMouseDown = false;
+      this.rightMouseDown = false;
+      this.moveTargetActive = false;
+      this.targetEnemyId = null;
+      this.targetLootId = null;
+      this.targetPortal = false;
       this.bufferedSlot = null;
       this.bufferedTimer = 0;
     }
@@ -857,6 +1056,7 @@ export class AshenEngine {
           aimAngle: Math.PI,
           orbitDir: Math.random() < 0.5 ? 1 : -1,
           bossAttackIndex: 0,
+          bossPhase: isBoss ? 1 : undefined,
           scaleX: 1,
           scaleY: 1,
         });
@@ -872,6 +1072,19 @@ export class AshenEngine {
             '#F97316',
             'burn',
             10 + tier * 3
+          );
+        }
+      }
+      if (this.domain.modifiers.some((m) => m.chillingGround)) {
+        for (let c = 0; c < 4; c++) {
+          this.spawnDecal(
+            480 + c * 195,
+            210 + ((c * 210) % (room.height - 380)),
+            72,
+            999,
+            '#22D3EE',
+            'frost',
+            1
           );
         }
       }
@@ -949,9 +1162,22 @@ export class AshenEngine {
     const skillId = this.hotbar[slotIdx];
     const skill = SKILLS[skillId];
     const prog = this.skillProgress[skillId];
+    // Aim toward cursor when casting any skill & pause walk waypoint for non-movement casts
+    if (this.pointerInitialized && this.targetEnemyId === null) {
+      const world = this.screenToWorld(this.mouseScreenX, this.mouseScreenY);
+      this.pAimAngle = Math.atan2(world.y - this.py, world.x - this.px);
+    }
+    if (skill.category !== 'movement') {
+      this.moveTargetActive = false;
+    } else {
+      this.moveTargetActive = false;
+      this.targetEnemyId = null;
+      this.targetLootId = null;
+      this.targetPortal = false;
+    }
 
     // Resource cost calculation
-    let cost = skill.manaCost;
+    let cost = Math.round(skill.manaCost * this.stats.manaCostMult);
     if (skill.id === 'ashen_nova' && prog.choices[5] === 'C') cost = Math.round(cost * 0.7);
     const isEclipseEmpowered =
       this.activeAspects.includes('eclipse') && this.eclipseReady && skill.category !== 'defensive';
@@ -967,7 +1193,7 @@ export class AshenEngine {
     }
 
     // Cooldown calculation
-    let cd = skill.cooldown / this.stats.actionSpeedMult;
+    let cd = (skill.cooldown * this.stats.cooldownRecoveryMult) / this.stats.actionSpeedMult;
     if (skill.tags.includes('area') && this.activeAspects.includes('earthquake')) {
       cd *= 1.15;
     }
@@ -982,6 +1208,14 @@ export class AshenEngine {
     if (skill.id === 'seismic_slam' && prog.choices[10] === 'C') cd *= 0.8;
     if (skill.id === 'void_tendrils' && prog.choices[15] === 'A') cd *= 0.7;
     if (skill.id === 'radiant_barrier' && prog.choices[10] === 'C') cd *= 0.8;
+    if (skill.id === 'crimson_whirlwind' && prog.choices[10] === 'C') cd *= 0.8;
+    if (skill.id === 'arcane_orb' && prog.choices[15] === 'C') cd *= 0.75;
+    if (skill.id === 'glacial_cascade' && prog.choices[10] === 'C') cd *= 0.8;
+    if (skill.id === 'rift_blade' && prog.choices[15] === 'C') cd *= 0.75;
+    if (skill.id === 'soul_harvest' && prog.choices[10] === 'C') cd *= 0.8;
+    if (skill.id === 'meteor_brand' && prog.choices[10] === 'C') cd *= 0.78;
+    if (skill.id === 'tempest_nova' && prog.choices[10] === 'C') cd *= 0.8;
+    if (skill.id === 'bulwark_charge' && prog.choices[10] === 'C') cd *= 0.75;
 
     this.pCooldowns[slotIdx] = cd;
     this.pMaxCooldowns[slotIdx] = cd;
@@ -1397,6 +1631,298 @@ export class AshenEngine {
 
       this.spawnDecal(tx, ty, radius, dur, '#A855F7', 'void', calc.finalDamage * 0.9);
       this.burstParticles(tx, ty, '#A855F7', 20, 'outer');
+      return;
+    }
+
+    if (skillId === 'crimson_whirlwind') {
+      const radius = skill.radius * (prog.choices[5] === 'B' ? 1.3 : 1) * this.stats.areaMult;
+      this.slashEffects.push({
+        x: this.px,
+        y: this.py,
+        angle,
+        arc: Math.PI * 2,
+        radius,
+        color: isEclipseEmpowered ? '#D99B38' : '#DC2626',
+        life: 0.28,
+        maxLife: 0.28,
+      });
+      for (let i = 0; i <= 8; i++) {
+        const a = angle + (i / 8) * Math.PI * 2;
+        this.weaponTrail.push({
+          x: this.px + Math.cos(a) * radius * 0.78,
+          y: this.py + Math.sin(a) * radius * 0.78,
+          life: 0.2,
+          color: '#DC2626',
+        });
+      }
+      const hits = this.damageEnemiesInRadius(this.px, this.py, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+      if (prog.choices[5] === 'C' && hits.length > 0) {
+        this.pHp = Math.min(this.stats.maxLife, this.pHp + hits.length * 12);
+      }
+      if (prog.choices[10] === 'B') {
+        for (const e of hits) {
+          if (!e.isDummy && e.archetype !== 'boss') {
+            e.x += (this.px - e.x) * 0.25;
+            e.y += (this.py - e.y) * 0.25;
+          }
+        }
+      }
+      if (prog.choices[15] === 'C') this.fleetfootTimer = 1.5;
+      this.pScaleX = 1.2;
+      this.pScaleY = 0.82;
+      this.burstParticles(this.px, this.py, '#DC2626', 18, 'spark');
+      return;
+    }
+
+    if (skillId === 'arcane_orb') {
+      const count = prog.choices[5] === 'C' ? 2 : 1;
+      const spd = prog.choices[10] === 'B' ? 430 : 330;
+      const explodeRadius = prog.choices[5] === 'B' ? 120 : 88;
+      for (let i = 0; i < count; i++) {
+        const a = angle + (count === 2 ? (i === 0 ? -0.14 : 0.14) : 0);
+        this.projectiles.push({
+          active: true,
+          fromPlayer: true,
+          skillId,
+          x: this.px + Math.cos(a) * 22,
+          y: this.py + Math.sin(a) * 22,
+          vx: Math.cos(a) * spd,
+          vy: Math.sin(a) * spd,
+          radius: skill.radius,
+          damageType: skill.damageType,
+          damage: 0,
+          isCrit: false,
+          life: 1.5,
+          pierceLeft: 6,
+          originX: this.px,
+          originY: this.py,
+          explodeRadius,
+          hitIds: new Set(),
+          empowered: isShadeEmpowered || isEclipseEmpowered,
+        });
+      }
+      this.pScaleX = 1.14;
+      this.pScaleY = 0.88;
+      this.burstParticles(this.px + Math.cos(angle) * 22, this.py + Math.sin(angle) * 22, color, 12, 'outer');
+      return;
+    }
+
+    if (skillId === 'glacial_cascade') {
+      const steps = prog.choices[15] === 'B' ? 4 : 3;
+      const stepDist = prog.choices[5] === 'C' ? 115 : 90;
+      const rad = skill.radius * this.stats.areaMult;
+      for (let s = 1; s <= steps; s++) {
+        const cx = this.px + Math.cos(angle) * (s * stepDist);
+        const cy = this.py + Math.sin(angle) * (s * stepDist);
+        this.slashEffects.push({
+          x: cx,
+          y: cy,
+          angle: 0,
+          arc: Math.PI * 2,
+          radius: rad * (0.85 + s * 0.1),
+          color,
+          life: 0.25 + s * 0.04,
+          maxLife: 0.25 + s * 0.04,
+        });
+        this.damageEnemiesInRadius(cx, cy, rad, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+        this.burstParticles(cx, cy, color, 10, 'core');
+      }
+      if (prog.choices[10] === 'B') {
+        this.spawnDecal(this.px + Math.cos(angle) * 180, this.py + Math.sin(angle) * 180, 110, 3.0, '#22D3EE', 'frost', 1);
+      }
+      if (prog.choices[15] === 'C') {
+        this.pEs = Math.min(this.stats.maxEnergyShield, this.pEs + 12);
+      }
+      this.pScaleX = 1.18;
+      this.pScaleY = 0.84;
+      return;
+    }
+
+    if (skillId === 'rift_blade') {
+      const dist = prog.choices[5] === 'B' ? skill.range * 1.25 : skill.range;
+      const room = this.domain.rooms[this.currentRoomIdx];
+      const oldX = this.px;
+      const oldY = this.py;
+      for (let i = 0; i < 4; i++) {
+        const t = i / 4;
+        const ix = oldX + Math.cos(angle) * dist * t;
+        const iy = oldY + Math.sin(angle) * dist * t;
+        this.afterImages.push({ x: ix, y: iy, life: 0.34, color: '#A855F7' });
+        this.weaponTrail.push({ x: ix, y: iy, life: 0.2, color: '#A855F7' });
+      }
+      this.px = Math.max(40, Math.min(room.width - 40, oldX + Math.cos(angle) * dist));
+      this.py = Math.max(40, Math.min(room.height - 40, oldY + Math.sin(angle) * dist));
+      this.resolvePlayerObstacles();
+      this.pInvulnTimer = Math.max(this.pInvulnTimer, prog.choices[10] === 'C' ? 0.35 : 0.2);
+
+      const width = skill.radius * (prog.choices[10] === 'B' ? 1.3 : 1) * this.stats.areaMult;
+      const hits = this.damageEnemiesInRadius(
+        (oldX + this.px) * 0.5,
+        (oldY + this.py) * 0.5,
+        dist * 0.55 + width * 0.4,
+        skillId,
+        isShadeEmpowered,
+        isEclipseEmpowered,
+        prog.choices[15] === 'A'
+      );
+      if (prog.choices[5] === 'C') {
+        for (const e of hits) e.witheredTimer = Math.max(e.witheredTimer, 3.0);
+      }
+      if (prog.choices[15] === 'B') {
+        this.spawnDecal(this.px, this.py, 85, 2.5, '#A855F7', 'void', 22 + prog.level * 5);
+      }
+      if (this.activeAspects.includes('shade')) {
+        this.shadeEmpowered = true;
+        this.shadeTimer = 4;
+      }
+      this.pScaleX = 0.78;
+      this.pScaleY = 1.24;
+      this.burstParticles(this.px, this.py, '#A855F7', 16, 'spark');
+      soundEngine.playDash();
+      return;
+    }
+
+    if (skillId === 'soul_harvest') {
+      const radius = skill.radius * (prog.choices[5] === 'C' ? 1.25 : 1) * this.stats.areaMult;
+      this.slashEffects.push({
+        x: this.px,
+        y: this.py,
+        angle: 0,
+        arc: Math.PI * 2,
+        radius,
+        color: '#A855F7',
+        life: 0.3,
+        maxLife: 0.3,
+      });
+      const hits = this.damageEnemiesInRadius(this.px, this.py, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+      for (const e of hits) {
+        if (prog.choices[10] === 'B') {
+          e.chillTimer = Math.max(e.chillTimer, 2.5);
+          e.chillStrength = Math.max(e.chillStrength, 0.35);
+        }
+        e.witheredTimer = Math.max(e.witheredTimer, 2.5);
+      }
+      if (prog.choices[5] === 'B' && hits.length > 0) {
+        this.pHp = Math.min(this.stats.maxLife, this.pHp + Math.round(this.stats.maxLife * 0.04 * hits.length));
+      }
+      if (prog.choices[15] === 'C' && hits.length > 0) {
+        this.pMp = Math.min(this.stats.maxMana, this.pMp + 15 * hits.length);
+      }
+      if (prog.choices[10] === 'A') {
+        this.spawnDecal(this.px, this.py, radius * 0.75, 3.0, '#A855F7', 'void', 24 + prog.level * 5);
+      }
+      this.pScaleX = 1.18;
+      this.pScaleY = 0.84;
+      this.burstParticles(this.px, this.py, '#A855F7', 22, 'outer');
+      return;
+    }
+
+    if (skillId === 'meteor_brand') {
+      const world = this.pointerInitialized
+        ? this.screenToWorld(this.mouseScreenX, this.mouseScreenY)
+        : { x: this.px + Math.cos(angle) * 200, y: this.py + Math.sin(angle) * 200 };
+      const dist = Math.min(skill.range, Math.hypot(world.x - this.px, world.y - this.py));
+      const tx = this.px + Math.cos(angle) * dist;
+      const ty = this.py + Math.sin(angle) * dist;
+      const radius = skill.radius * (prog.choices[5] === 'B' ? 1.3 : 1) * this.stats.areaMult;
+
+      this.slashEffects.push({
+        x: tx,
+        y: ty,
+        angle: 0,
+        arc: Math.PI * 2,
+        radius,
+        color: isEclipseEmpowered ? '#D99B38' : '#F97316',
+        life: 0.34,
+        maxLife: 0.34,
+      });
+      this.spawnDecal(tx, ty, radius * 0.72, 3.2, '#F97316', 'crack');
+      const hits = this.damageEnemiesInRadius(tx, ty, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+      for (const e of hits) {
+        if (prog.choices[5] === 'C') {
+          e.burnTimer = 3.0;
+          e.burnDps = Math.max(e.burnDps, (24 + prog.level * 6) * this.stats.burnMagnitudeMult);
+        }
+        if (prog.choices[10] === 'B') e.stunTimer = Math.max(e.stunTimer, 0.8);
+      }
+      if (prog.choices[15] === 'B') {
+        this.damageEnemiesInRadius(tx + 70, ty - 45, radius * 0.65, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+      }
+      this.burstParticles(tx, ty, '#F97316', 28, 'outer');
+      this.addTrauma(0.35);
+      return;
+    }
+
+    if (skillId === 'tempest_nova') {
+      const radius = skill.radius * (prog.choices[5] === 'C' ? 1.3 : 1) * this.stats.areaMult;
+      this.slashEffects.push({
+        x: this.px,
+        y: this.py,
+        angle: 0,
+        arc: Math.PI * 2,
+        radius,
+        color,
+        life: 0.28,
+        maxLife: 0.28,
+      });
+      const hits = this.damageEnemiesInRadius(this.px, this.py, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
+      if (prog.choices[5] === 'B') {
+        for (const e of hits) e.shockTimer = Math.max(e.shockTimer, 3.0);
+      }
+      if (prog.choices[10] === 'A' && hits.length > 0) {
+        const pts: Array<{ x: number; y: number }> = [{ x: this.px, y: this.py }];
+        for (let i = 0; i < Math.min(3, hits.length); i++) pts.push({ x: hits[i].x, y: hits[i].y });
+        this.lightningEffects.push({ points: pts, color, life: 0.18, maxLife: 0.18 });
+      }
+      if (prog.choices[15] === 'C') {
+        this.pEs = Math.min(this.stats.maxEnergyShield, this.pEs + 12);
+      }
+      this.burstParticles(this.px, this.py, color, 22, 'spark');
+      this.addTrauma(0.24);
+      return;
+    }
+
+    if (skillId === 'bulwark_charge') {
+      const room = this.domain.rooms[this.currentRoomIdx];
+      const dist = skill.range;
+      this.px = Math.max(40, Math.min(room.width - 40, this.px + Math.cos(angle) * dist));
+      this.py = Math.max(40, Math.min(room.height - 40, this.py + Math.sin(angle) * dist));
+      this.resolvePlayerObstacles();
+      this.pInvulnTimer = Math.max(this.pInvulnTimer, prog.choices[10] === 'A' ? 0.4 : 0.22);
+      if (prog.choices[5] === 'B') {
+        this.pEs = Math.min(this.stats.maxEnergyShield, this.pEs + 40);
+      }
+      if (prog.choices[15] === 'B') {
+        this.barrierTimer = Math.max(this.barrierTimer, 3.0);
+        this.recomputeStats(false);
+      }
+      const hits = this.damageEnemiesInRadius(
+        this.px,
+        this.py,
+        skill.radius * this.stats.areaMult,
+        skillId,
+        isShadeEmpowered,
+        isEclipseEmpowered,
+        prog.choices[15] === 'C'
+      );
+      for (const e of hits) {
+        if (prog.choices[5] === 'C') e.stunTimer = Math.max(e.stunTimer, 0.9);
+        if (prog.choices[10] === 'B') e.armour = Math.max(0, Math.round(e.armour * 0.75));
+      }
+      this.slashEffects.push({
+        x: this.px,
+        y: this.py,
+        angle: angle,
+        arc: 2.1,
+        radius: skill.radius,
+        color: '#D99B38',
+        life: 0.24,
+        maxLife: 0.24,
+      });
+      this.pScaleX = 1.24;
+      this.pScaleY = 0.78;
+      this.burstParticles(this.px, this.py, '#D99B38', 18, 'core');
+      soundEngine.playDash();
     }
   }
 
@@ -1445,6 +1971,12 @@ export class AshenEngine {
     if (skillId === 'ember_bolt' && prog.choices[15] === 'A') critChance += 0.1;
     if (skillId === 'frost_lance' && prog.choices[5] === 'B') critChance += 0.08;
     if (skillId === 'bone_spear' && prog.choices[10] === 'B') critChance += 0.08;
+    if (skillId === 'crimson_whirlwind' && prog.choices[10] === 'A') critChance += 0.1;
+    if (skillId === 'glacial_cascade' && prog.choices[10] === 'A') critChance += 0.1;
+    if (skillId === 'rift_blade' && prog.choices[10] === 'A') critChance += 0.12;
+    if (skillId === 'soul_harvest' && prog.choices[15] === 'B') critChance += 0.15;
+    if (skillId === 'meteor_brand' && prog.choices[10] === 'A') critChance += 0.1;
+    if (skillId === 'tempest_nova' && prog.choices[10] === 'B') critChance += 0.1;
     if (isEclipseEmpowered && this.stats.activeMarks.includes('eclipse_core')) critChance += 0.15;
 
     const isCrit = forceCrit || Math.random() < Math.min(0.95, critChance);
@@ -1460,6 +1992,8 @@ export class AshenEngine {
       isDistantTarget: dist > 210,
       isLowLife: this.isPlayerLowLife(),
       isCrit,
+      isTargetChilled: enemy.chillTimer > 0,
+      isHighMana: this.pMp >= this.stats.maxMana * 0.6,
       enemyResistPct: enemy.resistPct,
       enemyArmour: enemy.armour,
     });
@@ -1477,6 +2011,27 @@ export class AshenEngine {
       enemy.vy += ky * (enemy.archetype === 'boss' ? 0.15 : 0.7);
     } else {
       enemy.hp = Math.max(1, enemy.hp);
+    }
+
+    // Multi-Phase Pinnacle Boss Enrage at <= 50% HP (M4.4)
+    if (enemy.archetype === 'boss' && enemy.bossPhase === 1 && enemy.hp > 0 && enemy.hp <= enemy.maxHp * 0.5) {
+      enemy.bossPhase = 2;
+      enemy.speed *= 1.25;
+      enemy.damage = Math.round(enemy.damage * 1.18);
+      this.slashEffects.push({
+        x: enemy.x,
+        y: enemy.y,
+        angle: 0,
+        arc: Math.PI * 2,
+        radius: 220,
+        color: '#DC2626',
+        life: 0.45,
+        maxLife: 0.45,
+      });
+      this.burstParticles(enemy.x, enemy.y, '#DC2626', 32, 'outer');
+      this.spawnFloatingText(enemy.x, enemy.y - 54, 'PHASE II — ECLIPSE ENRAGE!', '#DC2626', true);
+      soundEngine.playBossPhaseShift();
+      this.addTrauma(0.45);
     }
 
     if (this.inSanctuary && enemy.isDummy) {
@@ -1497,6 +2052,11 @@ export class AshenEngine {
     if (skill.damageType === 'cold') {
       enemy.chillTimer = 2.6;
       enemy.chillStrength = Math.min(0.55, 0.25 * this.stats.chillEffectMult);
+    }
+    // Fire Burn scaling with Pyromancer Aspect
+    if (skill.damageType === 'fire' && this.activeAspects.includes('pyromancer')) {
+      enemy.burnTimer = Math.max(enemy.burnTimer, 2.5);
+      enemy.burnDps = Math.max(enemy.burnDps, Math.round(finalDmg * 0.22 * this.stats.burnMagnitudeMult));
     }
 
     // Critical Momentum Mark
@@ -1525,6 +2085,9 @@ export class AshenEngine {
       isCrit
     );
     this.burstParticles(enemy.x, enemy.y, DAMAGE_COLORS[skill.damageType], isCrit ? 15 : 7, 'core');
+    if (isCrit || isEclipseEmpowered) {
+      this.spawnCritStreak(enemy.x, enemy.y, DAMAGE_COLORS[skill.damageType], isEclipseEmpowered);
+    }
     soundEngine.playHit(isCrit);
 
     if (isCrit || (!enemy.isDummy && enemy.hp <= 0)) {
@@ -1568,6 +2131,13 @@ export class AshenEngine {
       });
     }
 
+    if (this.stats.killLifeGain > 0) {
+      this.pHp = Math.min(this.stats.maxLife, this.pHp + this.stats.killLifeGain);
+    }
+    if (this.stats.killManaGain > 0) {
+      this.pMp = Math.min(this.stats.maxMana, this.pMp + this.stats.killManaGain);
+    }
+
     if (enemy.archetype === 'boss') {
       this.callbacks.onPinnacleBossKilled();
     }
@@ -1594,6 +2164,19 @@ export class AshenEngine {
       return;
     }
     this.trauma = Math.min(0.95, this.trauma + amount);
+  }
+
+  private spawnCritStreak(x: number, y: number, color: string, chromatic: boolean) {
+    const s = this.critStreaks[this.critStreakCursor];
+    this.critStreakCursor = (this.critStreakCursor + 1) % CRIT_STREAK_POOL_SIZE;
+    s.active = true;
+    s.x = x;
+    s.y = y;
+    s.width = chromatic ? 160 : 115;
+    s.color = color;
+    s.maxLife = 0.22;
+    s.life = 0.22;
+    s.chromatic = chromatic;
   }
 
   private burstParticles(
@@ -1675,6 +2258,11 @@ export class AshenEngine {
       f.y += f.vy * dt;
       f.life -= dt;
       if (f.life <= 0) f.active = false;
+    }
+    for (const s of this.critStreaks) {
+      if (!s.active) continue;
+      s.life -= dt;
+      if (s.life <= 0) s.active = false;
     }
     for (let i = this.slashEffects.length - 1; i >= 0; i--) {
       this.slashEffects[i].life -= dt;
@@ -1773,12 +2361,15 @@ export class AshenEngine {
       this.pVeilShield = 0;
     }
 
-    // Energy Shield & Mana & Regrowth regen
+    // Energy Shield & Mana & Regrowth regen (with Immortal Ward ES recharge speed)
     this.pMp = Math.min(this.stats.maxMana, this.pMp + (10 + this.stats.maxMana * 0.08) * dt);
     if (this.pEsRechargeDelay > 0) {
-      this.pEsRechargeDelay -= dt;
+      this.pEsRechargeDelay -= dt * this.stats.esRechargeMult;
     } else if (this.pEs < this.stats.maxEnergyShield) {
-      this.pEs = Math.min(this.stats.maxEnergyShield, this.pEs + Math.max(12, this.stats.maxEnergyShield * 0.25) * dt);
+      this.pEs = Math.min(
+        this.stats.maxEnergyShield,
+        this.pEs + Math.max(12, this.stats.maxEnergyShield * 0.25) * this.stats.esRechargeMult * dt
+      );
     }
     if (this.regrowthBank > 0) {
       const healTick = Math.min(this.regrowthBank, Math.max(4, this.regrowthBank * 0.6) * dt);
@@ -1786,17 +2377,96 @@ export class AshenEngine {
       this.pHp = Math.min(this.stats.maxLife, this.pHp + healTick);
     }
 
-    // Held primary attack auto-repeat
-    if (this.mouseDown && this.pCooldowns[0] <= 0) {
-      this.tryCastSlot(0);
-    }
+    const room = this.domain.rooms[this.currentRoomIdx];
+    const shiftHeld = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
 
-    // Player Aim & Movement
-    if (this.pointerInitialized) {
+    // Held RMB or Shift+LMB auto-repeat primary skill toward cursor
+    if (this.rightMouseDown || (this.leftMouseDown && shiftHeld)) {
+      this.moveTargetActive = false;
+      if (this.pointerInitialized) {
+        const worldMouse = this.screenToWorld(this.mouseScreenX, this.mouseScreenY);
+        this.pAimAngle = Math.atan2(worldMouse.y - this.py, worldMouse.x - this.px);
+      }
+      if (this.pCooldowns[0] <= 0) {
+        this.tryCastSlot(0);
+      }
+    } else if (
+      this.leftMouseDown &&
+      this.targetEnemyId === null &&
+      this.targetLootId === null &&
+      !this.targetPortal &&
+      this.pointerInitialized
+    ) {
+      // Holding LMB steers continuously toward cursor (Diablo / PoE continuous click-move)
       const worldMouse = this.screenToWorld(this.mouseScreenX, this.mouseScreenY);
-      this.pAimAngle = Math.atan2(worldMouse.y - this.py, worldMouse.x - this.px);
+      this.moveTargetX = Math.max(36, Math.min(room.width - 36, worldMouse.x));
+      this.moveTargetY = Math.max(36, Math.min(room.height - 36, worldMouse.y));
+      this.moveTargetKind = 'move';
+      this.moveTargetActive = true;
     }
 
+    // Track targeted enemy (chase into skill range & attack)
+    if (this.targetEnemyId !== null) {
+      const target = this.enemies.find((en) => en.id === this.targetEnemyId && en.koTimer === 0);
+      if (!target) {
+        this.targetEnemyId = null;
+        this.moveTargetActive = false;
+      } else {
+        const skill = SKILLS[this.hotbar[0]];
+        const reach =
+          skill.category === 'melee'
+            ? Math.max(96, skill.range * 0.88)
+            : Math.max(280, skill.range * 0.78);
+        const dist = Math.hypot(target.x - this.px, target.y - this.py);
+        if (dist <= reach + target.radius) {
+          this.moveTargetActive = false;
+          this.pAimAngle = Math.atan2(target.y - this.py, target.x - this.px);
+          if (this.pCooldowns[0] <= 0) {
+            this.tryCastSlot(0);
+          }
+          if (!this.leftMouseDown) {
+            this.targetEnemyId = null;
+          }
+        } else {
+          this.moveTargetX = target.x;
+          this.moveTargetY = target.y;
+          this.moveTargetKind = 'attack';
+          this.moveTargetActive = true;
+        }
+      }
+    }
+
+    // Track clicked loot item
+    if (this.targetLootId !== null) {
+      const lootIdx = this.groundLoot.findIndex((g) => g.id === this.targetLootId);
+      if (lootIdx < 0) {
+        this.targetLootId = null;
+        this.moveTargetActive = false;
+      } else {
+        const g = this.groundLoot[lootIdx];
+        if (Math.hypot(g.x - this.px, g.y - this.py) <= 72) {
+          this.collectLoot(lootIdx);
+          this.targetLootId = null;
+          this.moveTargetActive = false;
+        }
+      }
+    }
+
+    // Track clicked exit portal
+    if (this.targetPortal) {
+      if (!room.cleared || this.currentRoomIdx >= this.domain.rooms.length - 1) {
+        this.targetPortal = false;
+        this.moveTargetActive = false;
+      } else if (Math.hypot(room.portalX - this.px, room.portalY - this.py) <= 88) {
+        this.targetPortal = false;
+        this.moveTargetActive = false;
+        this.enterRoom(this.currentRoomIdx + 1);
+        soundEngine.playDash();
+        return;
+      }
+    }
+
+    // Movement vector: WASD/Arrows override click-to-move cleanly (PoE2 dual input)
     let ix = 0;
     let iy = 0;
     if (this.keys.has('KeyW') || this.keys.has('ArrowUp')) iy -= 1;
@@ -1804,22 +2474,68 @@ export class AshenEngine {
     if (this.keys.has('KeyA') || this.keys.has('ArrowLeft')) ix -= 1;
     if (this.keys.has('KeyD') || this.keys.has('ArrowRight')) ix += 1;
 
-    const ilen = Math.hypot(ix, iy);
-    if (ilen > 0) {
+    const hasKeyboardMove = ix !== 0 || iy !== 0;
+    if (hasKeyboardMove) {
+      this.moveTargetActive = false;
+      this.targetEnemyId = null;
+      this.targetLootId = null;
+      this.targetPortal = false;
+      const ilen = Math.hypot(ix, iy);
       ix /= ilen;
       iy /= ilen;
+      if (this.pointerInitialized) {
+        const worldMouse = this.screenToWorld(this.mouseScreenX, this.mouseScreenY);
+        this.pAimAngle = Math.atan2(worldMouse.y - this.py, worldMouse.x - this.px);
+      }
+    } else if (this.moveTargetActive) {
+      const dx = this.moveTargetX - this.px;
+      const dy = this.moveTargetY - this.py;
+      const dist = Math.hypot(dx, dy);
+      if (dist <= 10) {
+        this.moveTargetActive = false;
+      } else {
+        ix = dx / dist;
+        iy = dy / dist;
+        this.pAimAngle = Math.atan2(iy, ix);
+      }
+    } else if (this.pointerInitialized) {
+      const worldMouse = this.screenToWorld(this.mouseScreenX, this.mouseScreenY);
+      this.pAimAngle = Math.atan2(worldMouse.y - this.py, worldMouse.x - this.px);
     }
 
     let moveSpeed = this.stats.movementSpeed;
     if (this.pVeilShield > 0) moveSpeed *= 0.85; // Veil drawback
     if (this.fleetfootTimer > 0) moveSpeed *= 1.25;
+    // Chilling Ground modifier slows player slightly when standing on frost decals
+    for (const d of this.decals) {
+      if (d.active && d.kind === 'frost' && Math.hypot(this.px - d.x, this.py - d.y) <= d.radius) {
+        moveSpeed *= 0.82;
+        break;
+      }
+    }
 
+    this.lastStepPx = this.px;
+    this.lastStepPy = this.py;
     this.pvx = ix * moveSpeed;
     this.pvy = iy * moveSpeed;
     this.px += this.pvx * dt;
     this.py += this.pvy * dt;
     this.pWalkPhase += Math.hypot(this.pvx * dt, this.pvy * dt) * 0.08;
     this.resolvePlayerObstacles();
+
+    // Cancel unheld ground waypoint if blocked on a wall/pillar
+    if (this.moveTargetActive && !this.leftMouseDown && this.targetEnemyId === null) {
+      const moved = Math.hypot(this.px - this.lastStepPx, this.py - this.lastStepPy);
+      if (moved < moveSpeed * dt * 0.12) {
+        this.stuckMoveTimer += dt;
+        if (this.stuckMoveTimer > 0.25) {
+          this.moveTargetActive = false;
+          this.stuckMoveTimer = 0;
+        }
+      } else {
+        this.stuckMoveTimer = 0;
+      }
+    }
 
     // Smooth camera follow
     this.camX += (this.px - this.camX) * Math.min(1, dt * 10);
@@ -1877,7 +2593,6 @@ export class AshenEngine {
     }
 
     // Update Projectiles
-    const room = this.domain.rooms[this.currentRoomIdx];
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const pr = this.projectiles[i];
       if (!pr.active) {
@@ -2088,10 +2803,11 @@ export class AshenEngine {
           }
           if (e.attackCooldown <= 0) {
             e.state = 'windup';
-            e.windupDuration = 0.72;
-            e.stateTimer = 0.72;
+            const isPhase2 = e.bossPhase === 2;
+            e.windupDuration = isPhase2 ? 0.56 : 0.72;
+            e.stateTimer = e.windupDuration;
             e.aimAngle = Math.atan2(dy, dx);
-            e.bossAttackIndex = (e.bossAttackIndex + 1) % 3;
+            e.bossAttackIndex = (e.bossAttackIndex + 1) % (isPhase2 ? 4 : 3);
             soundEngine.playBossTelegraph();
           }
         }
@@ -2127,8 +2843,8 @@ export class AshenEngine {
           } else if (e.archetype === 'boss') {
             this.executeBossAttack(e);
             e.state = 'recover';
-            e.stateTimer = 0.55;
-            e.attackCooldown = 1.75;
+            e.stateTimer = e.bossPhase === 2 ? 0.42 : 0.55;
+            e.attackCooldown = e.bossPhase === 2 ? 1.25 : 1.75;
           } else {
             // Thrall melee strike
             if (dist <= e.radius + 42) {
@@ -2200,7 +2916,7 @@ export class AshenEngine {
         return;
       }
       this.spawnFloatingText(this.px, this.py - 44, 'Chamber Cleared — Portal Open', '#D99B38', true);
-      soundEngine.playLootChime(false);
+      soundEngine.playChamberClear();
     }
 
     // Auto-walkover loot pickup
@@ -2239,32 +2955,34 @@ export class AshenEngine {
     const dmg = Math.round(boss.damage * (boss.witheredTimer > 0 ? 0.88 : 1));
     if (boss.bossAttackIndex === 0) {
       // Heavy Slam Ring
+      const rad = boss.bossPhase === 2 ? 195 : 170;
       this.slashEffects.push({
         x: boss.x,
         y: boss.y,
         angle: 0,
         arc: Math.PI * 2,
-        radius: 170,
+        radius: rad,
         color: '#DC2626',
         life: 0.3,
         maxLife: 0.3,
       });
       this.burstParticles(boss.x, boss.y, '#DC2626', 24, 'outer');
       this.addTrauma(0.32);
-      if (Math.hypot(this.px - boss.x, this.py - boss.y) < 170) {
+      if (Math.hypot(this.px - boss.x, this.py - boss.y) < rad) {
         this.damagePlayer(dmg, 'fire');
       }
     } else if (boss.bossAttackIndex === 1) {
-      // Radial Orb Volley (8 orbs)
-      for (let k = 0; k < 8; k++) {
-        const a = boss.aimAngle + (k * Math.PI * 2) / 8;
+      // Radial Orb Volley (8 or 12 orbs in Phase II)
+      const orbCount = boss.bossPhase === 2 ? 12 : 8;
+      for (let k = 0; k < orbCount; k++) {
+        const a = boss.aimAngle + (k * Math.PI * 2) / orbCount;
         this.projectiles.push({
           active: true,
           fromPlayer: false,
           x: boss.x,
           y: boss.y,
-          vx: Math.cos(a) * 280,
-          vy: Math.sin(a) * 280,
+          vx: Math.cos(a) * 285,
+          vy: Math.sin(a) * 285,
           radius: 11,
           damageType: 'fire',
           damage: Math.round(dmg * 0.8),
@@ -2276,17 +2994,18 @@ export class AshenEngine {
           hitIds: new Set(),
         });
       }
-    } else {
-      // Focused 3-bolt lance barrage
-      for (let k = -1; k <= 1; k++) {
-        const a = boss.aimAngle + k * 0.22;
+    } else if (boss.bossAttackIndex === 2) {
+      // Focused 3-bolt (or 5-bolt in Phase II) lance barrage
+      const half = boss.bossPhase === 2 ? 2 : 1;
+      for (let k = -half; k <= half; k++) {
+        const a = boss.aimAngle + k * 0.19;
         this.projectiles.push({
           active: true,
           fromPlayer: false,
           x: boss.x,
           y: boss.y,
-          vx: Math.cos(a) * 360,
-          vy: Math.sin(a) * 360,
+          vx: Math.cos(a) * 365,
+          vy: Math.sin(a) * 365,
           radius: 10,
           damageType: 'chaos',
           damage: Math.round(dmg * 0.85),
@@ -2298,6 +3017,29 @@ export class AshenEngine {
           hitIds: new Set(),
         });
       }
+    } else {
+      // Phase II Special: Dual-Spiral Chaos Surge + Ground Rift
+      for (let k = 0; k < 6; k++) {
+        const a = boss.aimAngle + k * (Math.PI / 3) + 0.25;
+        this.projectiles.push({
+          active: true,
+          fromPlayer: false,
+          x: boss.x,
+          y: boss.y,
+          vx: Math.cos(a) * 250,
+          vy: Math.sin(a) * 250,
+          radius: 12,
+          damageType: 'chaos',
+          damage: Math.round(dmg * 0.9),
+          isCrit: false,
+          life: 2.4,
+          pierceLeft: 0,
+          originX: boss.x,
+          originY: boss.y,
+          hitIds: new Set(),
+        });
+      }
+      this.spawnDecal(boss.x, boss.y, 120, 2.5, '#A855F7', 'crack');
     }
   }
 
@@ -2400,6 +3142,7 @@ export class AshenEngine {
 
   private render() {
     const ctx = this.ctx;
+    if (!ctx || !this.canvas) return;
     const w = this.canvas.clientWidth || window.innerWidth;
     const h = this.canvas.clientHeight || window.innerHeight;
 
@@ -2438,12 +3181,12 @@ export class AshenEngine {
     ctx.lineWidth = 8;
     ctx.strokeRect(4, 4, room.width - 8, room.height - 8);
 
-    // Layer 5: Ground Decals
+    // Layer 5: Ground Decals (burn, frost crystal, slam cracks, void tendrils)
     for (const d of this.decals) {
       if (!d.active) continue;
       const alpha = Math.min(1, d.life / Math.min(1, d.maxLife));
       ctx.save();
-      ctx.globalAlpha = alpha * 0.45;
+      ctx.globalAlpha = alpha * 0.42;
       ctx.fillStyle = d.color;
       ctx.beginPath();
       ctx.arc(d.x, d.y, d.radius, 0, Math.PI * 2);
@@ -2452,6 +3195,23 @@ export class AshenEngine {
       ctx.lineWidth = 2;
       ctx.globalAlpha = alpha * 0.7;
       ctx.stroke();
+      if (d.kind === 'crack') {
+        ctx.beginPath();
+        for (let c = 0; c < 6; c++) {
+          const a = (c * Math.PI) / 3 + 0.2;
+          ctx.moveTo(d.x + Math.cos(a) * 8, d.y + Math.sin(a) * 8);
+          ctx.lineTo(d.x + Math.cos(a) * d.radius * 0.9, d.y + Math.sin(a) * d.radius * 0.9);
+        }
+        ctx.stroke();
+      } else if (d.kind === 'frost') {
+        ctx.beginPath();
+        for (let c = 0; c < 6; c++) {
+          const a = (c * Math.PI) / 3;
+          ctx.moveTo(d.x, d.y);
+          ctx.lineTo(d.x + Math.cos(a) * d.radius * 0.72, d.y + Math.sin(a) * d.radius * 0.72);
+        }
+        ctx.stroke();
+      }
       ctx.restore();
     }
 
@@ -2521,25 +3281,58 @@ export class AshenEngine {
       ctx.fillRect(ob.x + 8, ob.y + 8, ob.w - 16, 4);
     }
 
-    // Ground Loot Beams (Tier 4 hierarchy)
+    // Shape-Coded Ground Loot Beams (M5.1 Accessibility + Tier 4 Hierarchy)
     for (const g of this.groundLoot) {
       const c = RARITY_COLORS[g.item.rarity];
-      const beamH = g.item.rarity === 'legendary' ? 68 : g.item.rarity === 'rare' ? 46 : 30;
+      const beamH = g.item.rarity === 'legendary' ? 72 : g.item.rarity === 'rare' ? 48 : 30;
+      const pulse = 7 + Math.sin(g.pulsePhase) * 1.4;
       ctx.save();
       const grad = ctx.createLinearGradient(g.x, g.y, g.x, g.y - beamH);
       grad.addColorStop(0, c);
       grad.addColorStop(1, 'transparent');
-      ctx.globalAlpha = 0.7;
+      ctx.globalAlpha = 0.72;
       ctx.fillStyle = grad;
       ctx.fillRect(g.x - 4, g.y - beamH, 8, beamH);
       ctx.globalAlpha = 1;
       ctx.fillStyle = c;
-      ctx.beginPath();
-      ctx.arc(g.x, g.y, 7 + Math.sin(g.pulsePhase) * 1.5, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.strokeStyle = '#0B0B0F';
+      ctx.lineWidth = 1.5;
+
+      if (g.item.rarity === 'legendary' || g.item.markId) {
+        // 6-point hex/star crest for Legendary or Mark-bearing chase drops
+        ctx.beginPath();
+        for (let p = 0; p < 6; p++) {
+          const a = (p * Math.PI) / 3 - Math.PI / 6;
+          const r = p % 2 === 0 ? pulse + 3.5 : pulse + 1;
+          const px = g.x + Math.cos(a) * r;
+          const py = g.y + Math.sin(a) * r;
+          if (p === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      } else if (g.item.rarity === 'rare') {
+        // Diamond for Rare drops
+        ctx.beginPath();
+        ctx.moveTo(g.x, g.y - pulse - 2);
+        ctx.lineTo(g.x + pulse + 2, g.y);
+        ctx.lineTo(g.x, g.y + pulse + 2);
+        ctx.lineTo(g.x - pulse - 2, g.y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        // Circle for Normal / Magic drops
+        ctx.beginPath();
+        ctx.arc(g.x, g.y, pulse, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+
       ctx.font = '600 11px "Plus Jakarta Sans", sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(g.item.name, g.x, g.y + 20);
+      ctx.fillText(g.item.name, g.x, g.y + 22);
       ctx.restore();
     }
 
@@ -2810,7 +3603,7 @@ export class AshenEngine {
       ctx.restore();
     }
 
-    // Additive Emissive Particle Layers
+      // Additive Emissive Particle Layers
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     for (const p of this.particles) {
@@ -2821,6 +3614,27 @@ export class AshenEngine {
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size * (p.layer === 'outer' ? 1.8 : 1), 0, Math.PI * 2);
       ctx.fill();
+    }
+
+    // M3.3 Anamorphic Horizontal Crit Streaks & Spectral Chromatic Flares
+    for (const s of this.critStreaks) {
+      if (!s.active) continue;
+      const t = Math.max(0, s.life / s.maxLife);
+      const halfW = s.width * (0.65 + (1 - t) * 0.45);
+      const grad = ctx.createLinearGradient(s.x - halfW, s.y, s.x + halfW, s.y);
+      grad.addColorStop(0, 'transparent');
+      grad.addColorStop(0.5, s.color);
+      grad.addColorStop(1, 'transparent');
+      ctx.globalAlpha = t * 0.85;
+      ctx.fillStyle = grad;
+      ctx.fillRect(s.x - halfW, s.y - 2.5, halfW * 2, 5);
+      if (s.chromatic) {
+        ctx.globalAlpha = t * 0.45;
+        ctx.fillStyle = '#22D3EE';
+        ctx.fillRect(s.x - halfW * 0.8, s.y - 5, halfW * 1.6, 2);
+        ctx.fillStyle = '#F97316';
+        ctx.fillRect(s.x - halfW * 0.8, s.y + 3, halfW * 1.6, 2);
+      }
     }
     ctx.restore();
 
@@ -2848,19 +3662,65 @@ export class AshenEngine {
     const bob = Math.sin(this.pWalkPhase) * 2;
     ctx.save();
 
-    // Aspect Auras around player (§7.2)
-    if (this.activeAspects.includes('iron')) {
+    // M3.4 Aspect Armour & Aura Visual Identity
+    if (this.activeAspects.includes('cinder') || this.activeAspects.includes('pyromancer')) {
+      ctx.strokeStyle = 'rgba(249, 115, 22, 0.55)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(this.px, this.py, 22 + Math.sin(this.simTime * 5) * 1.5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    if (this.activeAspects.includes('frigid') || this.activeAspects.includes('frostbite')) {
+      ctx.strokeStyle = 'rgba(34, 211, 238, 0.65)';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const a = (i * Math.PI) / 3 + this.simTime * 0.5;
+        const x1 = this.px + Math.cos(a) * 20;
+        const y1 = this.py + Math.sin(a) * 20;
+        const x2 = this.px + Math.cos(a) * 26;
+        const y2 = this.py + Math.sin(a) * 26;
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+      }
+      ctx.stroke();
+    }
+    if (this.activeAspects.includes('iron') || this.activeAspects.includes('bastion')) {
       ctx.strokeStyle = '#94A3B8';
       ctx.lineWidth = 3;
       ctx.beginPath();
-      ctx.arc(this.px, this.py, 21, 0, Math.PI * 2);
+      for (let i = 0; i < 4; i++) {
+        const a = (i * Math.PI) / 2 + 0.35;
+        ctx.arc(this.px, this.py, 21, a, a + 0.9);
+      }
       ctx.stroke();
     }
+    if (this.activeAspects.includes('storm')) {
+      ctx.strokeStyle = '#7DD3FC';
+      ctx.lineWidth = 2;
+      for (let side of [-1, 1]) {
+        const sa = this.pAimAngle + side * 1.45;
+        const sx = this.px + Math.cos(sa) * 18;
+        const sy = this.py + Math.sin(sa) * 18;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(sx + Math.cos(sa + 0.4) * 8, sy + Math.sin(sa + 0.4) * 8);
+        ctx.lineTo(sx + Math.cos(sa - 0.3) * 12, sy + Math.sin(sa - 0.3) * 12);
+        ctx.stroke();
+      }
+    }
     if (this.activeAspects.includes('aether') || this.pEs > 0 || this.barrierTimer > 0) {
-      ctx.strokeStyle = this.barrierTimer > 0 ? '#7DD3FC' : 'rgba(59, 130, 246, 0.7)';
-      ctx.lineWidth = this.barrierTimer > 0 ? 3 : 1.5;
+      ctx.strokeStyle = this.barrierTimer > 0 ? '#7DD3FC' : 'rgba(59, 130, 246, 0.72)';
+      ctx.lineWidth = this.barrierTimer > 0 ? 3 : 1.6;
       ctx.beginPath();
-      ctx.arc(this.px, this.py, 25, 0, Math.PI * 2);
+      for (let h = 0; h < 6; h++) {
+        const a = (h * Math.PI) / 3;
+        const hx = this.px + Math.cos(a) * 25;
+        const hy = this.py + Math.sin(a) * 25;
+        if (h === 0) ctx.moveTo(hx, hy);
+        else ctx.lineTo(hx, hy);
+      }
+      ctx.closePath();
       ctx.stroke();
     }
     if (this.activeAspects.includes('eclipse')) {
@@ -2882,7 +3742,7 @@ export class AshenEngine {
       ctx.setLineDash([]);
     }
 
-    // Player body (with squash & stretch)
+    // Player body (with squash & stretch + Blood Aspect pulsing veins)
     ctx.save();
     ctx.translate(this.px, this.py + bob * 0.4);
     ctx.scale(this.pScaleX, this.pScaleY);
@@ -2890,6 +3750,18 @@ export class AshenEngine {
     ctx.beginPath();
     ctx.arc(0, 0, 15, 0, Math.PI * 2);
     ctx.fill();
+    if (this.activeAspects.includes('blood') || this.activeAspects.includes('berserk')) {
+      ctx.strokeStyle = '#DC2626';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(-8, -4);
+      ctx.lineTo(-1, 2);
+      ctx.lineTo(7, -6);
+      ctx.moveTo(-4, 8);
+      ctx.lineTo(3, 1);
+      ctx.lineTo(9, 6);
+      ctx.stroke();
+    }
     ctx.lineWidth = 2.5;
     ctx.strokeStyle = this.activeAspects.includes('blood') ? '#DC2626' : '#D99B38';
     ctx.stroke();
@@ -2927,7 +3799,7 @@ export class AshenEngine {
     const skillCosts = this.hotbar.map((id) => {
       const s = SKILLS[id];
       const prog = this.skillProgress[id];
-      let c = s.manaCost;
+      let c = Math.round(s.manaCost * this.stats.manaCostMult);
       if (s.id === 'ashen_nova' && prog.choices[5] === 'C') c = Math.round(c * 0.7);
       if (this.eclipseReady && s.category !== 'defensive') c *= 2;
       return c;
@@ -2969,6 +3841,7 @@ export class AshenEngine {
       bossName: boss?.name ?? '',
       bossHp: boss ? Math.max(0, Math.round(boss.hp)) : 0,
       bossMaxHp: boss?.maxHp ?? 1,
+      bossPhase: boss?.bossPhase ?? 1,
       eclipseReady: this.eclipseReady,
       eclipseTimer: this.eclipseTimer,
       shadeReady: this.shadeEmpowered,
@@ -2992,5 +3865,61 @@ export class AshenEngine {
 
   public getAspectSlotCap(pinnacleKills: number): number {
     return getUnlockedAspectSlots(this.pLevel, pinnacleKills);
+  }
+
+  public getThreeRenderState() {
+    const room = this.domain.rooms[this.currentRoomIdx];
+    return {
+      phase: this.phase,
+      simTime: this.simTime,
+      hitstopTimer: this.hitstopTimer,
+      trauma: this.screenShakeEnabled ? this.trauma : 0,
+      highContrastTelegraphs: this.highContrastTelegraphs,
+      inSanctuary: this.inSanctuary,
+      roomIndex: this.currentRoomIdx,
+      roomWidth: room.width,
+      roomHeight: room.height,
+      roomCleared: room.cleared,
+      isBossRoom: room.isBossRoom,
+      obstacles: room.obstacles,
+      portalX: room.portalX,
+      portalY: room.portalY,
+      player: {
+        x: this.px,
+        y: this.py,
+        vx: this.pvx,
+        vy: this.pvy,
+        aimAngle: this.pAimAngle,
+        walkPhase: this.pWalkPhase,
+        scaleX: this.pScaleX,
+        scaleY: this.pScaleY,
+        hitFlash: this.pHitFlash,
+        invuln: this.pInvulnTimer > 0,
+        es: this.pEs,
+        veilShield: this.pVeilShield,
+        barrierActive: this.barrierTimer > 0,
+        eclipseReady: this.eclipseReady,
+        eclipseTimer: this.eclipseTimer,
+        activeAspects: this.activeAspects,
+        primaryDamageType: SKILLS[this.hotbar[0]].damageType,
+        moveTarget: {
+          active: this.moveTargetActive,
+          x: this.moveTargetX,
+          y: this.moveTargetY,
+          kind: this.moveTargetKind,
+        },
+      },
+      enemies: this.enemies,
+      projectiles: this.projectiles,
+      groundLoot: this.groundLoot,
+      slashEffects: this.slashEffects,
+      lightningEffects: this.lightningEffects,
+      afterImages: this.afterImages,
+      weaponTrail: this.weaponTrail,
+      particles: this.particles,
+      decals: this.decals,
+      critStreaks: this.critStreaks,
+      floatingTexts: this.floatingTexts,
+    };
   }
 }

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialSkillProgress, createStarterEquipment } from './data';
 import {
+  GODOT_MIGRATION_BLUEPRINT,
   ROADMAP_PHASES,
   computeRoadmapProgress,
   evaluateCurrentBuildBenchmark,
@@ -44,4 +45,12 @@ test('evaluateCurrentBuildBenchmark reflects early parity and endgame scaling', 
   );
   assert.equal(late.gateStatus, 'Endgame Ready');
   assert.ok(late.scaleFactorFromLv1 >= 6);
+});
+
+test('GODOT_MIGRATION_BLUEPRINT covers AshenEngine core loop and React-to-Node state mappings', () => {
+  assert.ok(GODOT_MIGRATION_BLUEPRINT.coreLoopSteps.length >= 4);
+  assert.ok(GODOT_MIGRATION_BLUEPRINT.stateMappings.length >= 4);
+  assert.ok(GODOT_MIGRATION_BLUEPRINT.sceneTree.includes('MainArena'));
+  assert.ok(GODOT_MIGRATION_BLUEPRINT.sceneTree.includes('GameState'));
+  assert.ok(GODOT_MIGRATION_BLUEPRINT.gdscriptLoopSnippet.includes('_physics_process'));
 });

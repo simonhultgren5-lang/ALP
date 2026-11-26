@@ -15,8 +15,10 @@ import {
   createStarterEquipment,
   getUnlockedAspectSlots,
 } from './game/data';
-import { AshenEngine } from './game/engine';
+import { AshenThreeEngine } from './game/threeEngine';
+import { CustomModelStatus, ModelSlotId } from './game/threeModelLoader';
 import { computeRoadmapProgress } from './game/roadmapData';
+import { exportSaveJson, importSaveJson } from './game/saveSystem';
 import {
   AspectId,
   EquipSlot,
@@ -30,11 +32,34 @@ import {
   UpgradeTier,
 } from './game/types';
 
-const ROADMAP_STORAGE_KEY = 'ashen_eclipse_roadmap_v1';
+const ROADMAP_STORAGE_KEY = 'ashen_eclipse_roadmap_v2';
 const HUD_SCALE_STORAGE_KEY = 'ashen_eclipse_hud_scale_v1';
 const HC_TELEGRAPHS_STORAGE_KEY = 'ashen_eclipse_hc_telegraphs_v1';
 const HITSTOP_STORAGE_KEY = 'ashen_eclipse_hitstop_v1';
 const SCREEN_SHAKE_STORAGE_KEY = 'ashen_eclipse_screenshake_v1';
+
+const ALL_ROADMAP_DONE: Record<string, boolean> = {
+  p1_d1: true,
+  p1_d2: true,
+  p1_d3: true,
+  p1_d4: true,
+  p2_d1: true,
+  p2_d2: true,
+  p2_d3: true,
+  p2_d4: true,
+  p3_d1: true,
+  p3_d2: true,
+  p3_d3: true,
+  p3_d4: true,
+  p4_d1: true,
+  p4_d2: true,
+  p4_d3: true,
+  p4_d4: true,
+  p5_d1: true,
+  p5_d2: true,
+  p5_d3: true,
+  p5_d4: true,
+};
 
 const INITIAL_HUD: HudSnapshot = {
   phase: 'title',
@@ -71,6 +96,7 @@ const INITIAL_HUD: HudSnapshot = {
   bossName: '',
   bossHp: 0,
   bossMaxHp: 1,
+  bossPhase: 1,
   eclipseReady: false,
   eclipseTimer: 8,
   shadeReady: false,
@@ -103,8 +129,8 @@ const INITIAL_HUD: HudSnapshot = {
 };
 
 export default function App() {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const engineRef = useRef<AshenEngine | null>(null);
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const engineRef = useRef<AshenThreeEngine | null>(null);
 
   const [selectedPresetId, setSelectedPresetId] = useState<string>(STARTER_PRESETS[0].id);
   const [hotbar, setHotbar] = useState<[SkillId, SkillId, SkillId, SkillId, SkillId]>(
@@ -122,6 +148,10 @@ export default function App() {
     'siphon',
     'veil',
     'hunter',
+    'berserk',
+    'arcane_surge',
+    'chronomancer',
+    'harvester',
   ]);
   const [skillProgress, setSkillProgress] = useState<Record<SkillId, SkillProgress>>(
     createInitialSkillProgress
@@ -143,6 +173,7 @@ export default function App() {
   const [minimalHud, setMinimalHud] = useState(false);
   const [muted, setMuted] = useState(false);
   const [hasActiveRun, setHasActiveRun] = useState(false);
+  const [customModels, setCustomModels] = useState<CustomModelStatus[]>([]);
 
   const [hudScale, setHudScale] = useState<HudScaleOption>(() => {
     try {
@@ -186,7 +217,7 @@ export default function App() {
     } catch {
       // ignore storage errors
     }
-    return { p1_d1: true, p1_d2: true, p1_d3: true, p1_d4: true };
+    return { ...ALL_ROADMAP_DONE };
   });
 
   useEffect(() => {
@@ -268,12 +299,12 @@ export default function App() {
     eng.startSanctuary();
   }, []);
 
-  // Initialize Canvas2D Engine once
+  // Initialize Three.js WebGL Engine once
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const mount = mountRef.current;
+    if (!mount) return;
 
-    const eng = new AshenEngine(canvas, createInitialSkillProgress(), {
+    const eng = new AshenThreeEngine(mount, createInitialSkillProgress(), {
       onHudUpdate: (snap) => setHud(snap),
       onLootCollected: (item) => {
         setBag((prev) => [item, ...prev].slice(0, 24));
@@ -310,6 +341,10 @@ export default function App() {
       createInitialSkillProgress(),
       20
     );
+    setCustomModels(eng.getCustomModelStatuses());
+    const unsubModels = eng.subscribeCustomModels(() => {
+      setCustomModels(eng.getCustomModelStatuses());
+    });
     eng.startLoop();
 
     // Support ?autostart=1
@@ -320,6 +355,7 @@ export default function App() {
     }
 
     return () => {
+      unsubModels();
       eng.destroy();
       engineRef.current = null;
     };
@@ -454,16 +490,65 @@ export default function App() {
     setEquipment((prev) => ({ ...prev, [slot]: applyCraftingBench(target, action) }));
   };
 
+  const handleExportSave = () => {
+    const json = exportSaveJson({
+      hotbar,
+      activeAspects,
+      unlockedAspects,
+      skillProgress,
+      equipment,
+      bag,
+      shards,
+      pinnacleKills,
+      maxDomainTier,
+      selectedDomainTier,
+      selectedModifierIds,
+      corrupted,
+      completedRoadmapIds,
+    });
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ashen-eclipse-save.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportSave = (rawJson: string): { ok: boolean; error?: string } => {
+    try {
+      const data = importSaveJson(rawJson);
+      setHotbar(data.hotbar);
+      setActiveAspects(data.activeAspects);
+      setUnlockedAspects(data.unlockedAspects);
+      setSkillProgress(data.skillProgress);
+      setEquipment(data.equipment);
+      setBag(data.bag);
+      setShards(data.shards);
+      setPinnacleKills(data.pinnacleKills);
+      setMaxDomainTier(data.maxDomainTier);
+      setSelectedDomainTier(data.selectedDomainTier);
+      setSelectedModifierIds(data.selectedModifierIds);
+      setCorrupted(data.corrupted);
+      if (Object.keys(data.completedRoadmapIds).length > 0) {
+        setCompletedRoadmapIds(data.completedRoadmapIds);
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Invalid save file.' };
+    }
+  };
+
   return (
     <div className="relative w-full h-full bg-[#0B0B0F] overflow-hidden">
-      {/* Isolated Canvas Mount */}
-      <div className="absolute inset-0">
-        <canvas
-          ref={canvasRef}
-          data-testid="game-canvas"
-          className="block w-full h-full cursor-crosshair"
-        />
-      </div>
+      {/* Isolated Three.js WebGL Mount */}
+      <div
+        ref={mountRef}
+        data-testid="game-canvas"
+        className="absolute inset-0 cursor-crosshair"
+      />
 
       {/* Title Screen */}
       {hud.phase === 'title' && !roadmapOpen && (
@@ -542,6 +627,18 @@ export default function App() {
           launchDomainRun(selectedDomainTier, corrupted, selectedModifierIds, false)
         }
         onEnterSanctuary={launchSanctuary}
+        onExportSave={handleExportSave}
+        onImportSave={handleImportSave}
+        customModels={customModels}
+        onUploadCustomModel={async (slot: ModelSlotId, file: File) => {
+          await engineRef.current?.loadCustomModelFile(slot, file);
+        }}
+        onClearCustomModel={(slot: ModelSlotId) => {
+          engineRef.current?.clearCustomModel(slot);
+        }}
+        onExportStarterKnightGlb={async () => {
+          await engineRef.current?.exportStarterKnightGlb();
+        }}
       />
 
       {/* Pause / Skill Upgrade / Victory / Game Over Modals */}
@@ -586,6 +683,7 @@ export default function App() {
             setCompletedRoadmapIds((prev) => ({ ...prev, [id]: !prev[id] }))
           }
           onResetChecklist={() => setCompletedRoadmapIds({})}
+          onMarkAllChecklist={() => setCompletedRoadmapIds({ ...ALL_ROADMAP_DONE })}
           onBackToTitle={() => {
             setRoadmapOpen(false);
             setHasActiveRun(false);

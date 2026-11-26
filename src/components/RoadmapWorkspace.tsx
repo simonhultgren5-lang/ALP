@@ -3,6 +3,7 @@ import { SKILLS } from '../game/data';
 import { downloadGodotStarterZip } from '../game/godotExport';
 import {
   BENCHMARK_PROFILES,
+  GODOT_MIGRATION_BLUEPRINT,
   ROADMAP_PHASES,
   RoadmapPhaseId,
   computeRoadmapProgress,
@@ -15,6 +16,7 @@ interface RoadmapWorkspaceProps {
   completedIds: Record<string, boolean>;
   onToggleDeliverable: (id: string) => void;
   onResetChecklist: () => void;
+  onMarkAllChecklist: () => void;
   onBackToTitle: () => void;
   onEnterVerticalSlice: () => void;
   hasActiveRun: boolean;
@@ -30,6 +32,7 @@ export function RoadmapWorkspace({
   completedIds,
   onToggleDeliverable,
   onResetChecklist,
+  onMarkAllChecklist,
   onBackToTitle,
   onEnterVerticalSlice,
   hasActiveRun,
@@ -39,7 +42,7 @@ export function RoadmapWorkspace({
   skillProgress,
   playerLevel,
 }: RoadmapWorkspaceProps) {
-  const [phaseFilter, setPhaseFilter] = useState<'all' | RoadmapPhaseId>('all');
+  const [phaseFilter, setPhaseFilter] = useState<'all' | RoadmapPhaseId | 'godot_migration'>('all');
   const [search, setSearch] = useState('');
   const [simLevelMode, setSimLevelMode] = useState<'live' | 10 | 25 | 50>('live');
 
@@ -58,6 +61,7 @@ export function RoadmapWorkspace({
   );
 
   const visiblePhases = useMemo(() => {
+    if (phaseFilter === 'godot_migration') return [];
     const q = search.trim().toLowerCase();
     return ROADMAP_PHASES.filter((p) => phaseFilter === 'all' || p.id === phaseFilter)
       .map((phase) => ({
@@ -71,6 +75,33 @@ export function RoadmapWorkspace({
         ),
       }))
       .filter((p) => p.deliverables.length > 0 || !q);
+  }, [phaseFilter, search]);
+
+  const showGodotMigration = useMemo(() => {
+    if (phaseFilter !== 'all' && phaseFilter !== 'godot_migration') return false;
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    const inCore = GODOT_MIGRATION_BLUEPRINT.coreLoopSteps.some(
+      (s) =>
+        s.title.toLowerCase().includes(q) ||
+        s.canvasSource.toLowerCase().includes(q) ||
+        s.godotTarget.toLowerCase().includes(q) ||
+        s.instructions.toLowerCase().includes(q)
+    );
+    const inState = GODOT_MIGRATION_BLUEPRINT.stateMappings.some(
+      (m) =>
+        m.reactOrigin.toLowerCase().includes(q) ||
+        m.godotNodeOrAutoload.toLowerCase().includes(q) ||
+        m.signalOrResource.toLowerCase().includes(q) ||
+        m.migrationNotes.toLowerCase().includes(q)
+    );
+    return (
+      inCore ||
+      inState ||
+      'godot migration'.includes(q) ||
+      'ashenengine'.includes(q) ||
+      'gdscript'.includes(q)
+    );
   }, [phaseFilter, search]);
 
   return (
@@ -142,17 +173,26 @@ export function RoadmapWorkspace({
                   style={{ width: `${progress.pct}%` }}
                 />
               </div>
-              <div className="flex items-center justify-between pt-1">
+              <div className="flex items-center justify-between pt-1 gap-2">
                 <span className="text-[11px] text-[#94A3B8]">
                   Saved locally in browser
                 </span>
-                <button
-                  type="button"
-                  onClick={onResetChecklist}
-                  className="text-[11px] text-[#94A3B8] hover:text-[#F8FAFC] underline cursor-pointer"
-                >
-                  Reset Checklist
-                </button>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={onMarkAllChecklist}
+                    className="text-[11px] text-[#D99B38] hover:text-[#FDE68A] underline cursor-pointer"
+                  >
+                    Mark All Verified
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onResetChecklist}
+                    className="text-[11px] text-[#94A3B8] hover:text-[#F8FAFC] underline cursor-pointer"
+                  >
+                    Reset Checklist
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -185,6 +225,17 @@ export function RoadmapWorkspace({
                   {p.number}. {p.shortLabel}
                 </button>
               ))}
+              <button
+                type="button"
+                onClick={() => setPhaseFilter('godot_migration')}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium whitespace-nowrap cursor-pointer ${
+                  phaseFilter === 'godot_migration'
+                    ? 'bg-[#232330] text-[#D99B38]'
+                    : 'text-[#94A3B8] hover:text-[#F8FAFC]'
+                }`}
+              >
+                Godot Migration
+              </button>
             </div>
 
             <div className="w-full sm:w-64">
@@ -204,9 +255,9 @@ export function RoadmapWorkspace({
 
           {/* Main 2-Column Layout: Phases (Left 8) + Live Balance Gate Comparator (Right 4) */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-            {/* Phase List */}
+            {/* Phase List & Godot Migration */}
             <div className="lg:col-span-8 space-y-6">
-              {visiblePhases.length === 0 ? (
+              {visiblePhases.length === 0 && !showGodotMigration ? (
                 <div className="p-8 rounded-xl bg-[#17171F] border border-[#272733] text-center space-y-2">
                   <p className="text-sm text-[#E6E4DD]">No deliverables match "{search}".</p>
                   <button
@@ -221,7 +272,8 @@ export function RoadmapWorkspace({
                   </button>
                 </div>
               ) : (
-                visiblePhases.map((phase) => {
+                <>
+                  {visiblePhases.map((phase) => {
                   const phaseDone = phase.deliverables.filter((d) => completedIds[d.id]).length;
                   return (
                     <section
@@ -321,7 +373,125 @@ export function RoadmapWorkspace({
                       </div>
                     </section>
                   );
-                })
+                })}
+
+                  {showGodotMigration && (
+                    <section
+                      id="godot-migration"
+                      aria-labelledby="godot-migration-heading"
+                      className="bg-[#17171F] border border-[#D99B38]/40 rounded-xl p-6 space-y-6"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-4 border-b border-[#272733] pb-4">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2 text-xs text-[#94A3B8] font-mono-tabular">
+                            <span className="text-[#D99B38] font-semibold">Architecture Guide</span>
+                            <span aria-hidden="true">·</span>
+                            <span>Canvas2D &amp; React → GDScript &amp; Godot 4 Nodes</span>
+                          </div>
+                          <h2
+                            id="godot-migration-heading"
+                            className="font-display text-xl font-bold text-[#F8FAFC]"
+                          >
+                            Godot Migration
+                          </h2>
+                          <p className="text-xs text-[#A1A1B5]">
+                            Step-by-step translation blueprint for moving the AshenEngine simulation loop and React state tree into Godot 4 Nodes, Autoloads, and Signals.
+                          </p>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={downloadGodotStarterZip}
+                          className="px-3 py-1.5 rounded bg-[#0B0B0F] hover:bg-[#232330] border border-[#D99B38]/60 text-[11px] font-medium text-[#FDE68A] whitespace-nowrap cursor-pointer shrink-0"
+                        >
+                          Export GDScript Starter (.zip)
+                        </button>
+                      </div>
+
+                      {/* 1. AshenEngine Core Loop Translation */}
+                      <div className="space-y-3">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-[#D99B38]">
+                          1. AshenEngine Core Loop → GDScript
+                        </h3>
+                        <div className="space-y-2.5">
+                          {GODOT_MIGRATION_BLUEPRINT.coreLoopSteps.map((step) => (
+                            <div
+                              key={step.step}
+                              className="p-4 rounded-lg bg-[#0B0B0F] border border-[#272733] space-y-2"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-sm font-semibold text-[#F8FAFC]">
+                                  Step {step.step}. {step.title}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[11px] font-mono-tabular">
+                                <div className="px-2.5 py-1.5 rounded bg-[#121218] border border-[#272733] text-[#94A3B8]">
+                                  <span className="text-[#64748B]">Canvas2D: </span>
+                                  {step.canvasSource}
+                                </div>
+                                <div className="px-2.5 py-1.5 rounded bg-[#121218] border border-[#D99B38]/30 text-[#FDE68A]">
+                                  <span className="text-[#D99B38]">Godot 4: </span>
+                                  {step.godotTarget}
+                                </div>
+                              </div>
+                              <p className="text-xs text-[#CBD5E1] leading-relaxed">
+                                {step.instructions}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* 2. React State → Godot Node Structure & Signals */}
+                      <div className="space-y-3">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-[#D99B38]">
+                          2. React State Management → Godot Node Structure &amp; Signals
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {GODOT_MIGRATION_BLUEPRINT.stateMappings.map((item) => (
+                            <div
+                              key={item.godotNodeOrAutoload}
+                              className="p-4 rounded-lg bg-[#0B0B0F] border border-[#272733] space-y-2"
+                            >
+                              <div className="text-xs font-semibold text-[#F8FAFC]">
+                                {item.godotNodeOrAutoload}
+                              </div>
+                              <div className="text-[11px] font-mono-tabular text-[#94A3B8]">
+                                From: <span className="text-[#CBD5E1]">{item.reactOrigin}</span>
+                              </div>
+                              <div className="text-[11px] font-mono-tabular text-[#10B981]">
+                                Via: {item.signalOrResource}
+                              </div>
+                              <p className="text-xs text-[#A1A1B5] leading-relaxed">
+                                {item.migrationNotes}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* 3. Target Scene Tree & GDScript Loop Pattern */}
+                      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 pt-1">
+                        <div className="space-y-2">
+                          <div className="text-xs font-semibold text-[#CBD5E1]">
+                            Target Godot 4 Node &amp; Autoload Tree
+                          </div>
+                          <pre className="p-3.5 rounded-lg bg-[#0B0B0F] border border-[#272733] text-[11px] font-mono-tabular text-[#E2E8F0] overflow-x-auto leading-relaxed">
+                            {GODOT_MIGRATION_BLUEPRINT.sceneTree}
+                          </pre>
+                        </div>
+                        <div className="space-y-2">
+                          <div className="text-xs font-semibold text-[#CBD5E1]">
+                            AshenEngine.update(dt) → _physics_process(dt)
+                          </div>
+                          <pre className="p-3.5 rounded-lg bg-[#0B0B0F] border border-[#272733] text-[11px] font-mono-tabular text-[#FDE68A] overflow-x-auto leading-relaxed">
+                            {GODOT_MIGRATION_BLUEPRINT.gdscriptLoopSnippet}
+                          </pre>
+                        </div>
+                      </div>
+                    </section>
+                  )}
+                </>
               )}
             </div>
 

@@ -7,15 +7,24 @@ test('crc32 produces standard IEEE 802.3 checksum for known input', () => {
   assert.equal(crc32(bytes), 0xcbf43926);
 });
 
-test('generateGodotStarterFiles includes core Godot 4 project, scene, and GDScript files', () => {
+test('generateGodotStarterFiles includes core Godot 4 project, scene, and Phase 1-5 scripts/shaders', () => {
   const files = generateGodotStarterFiles();
   const paths = files.map((f) => f.path);
   assert.ok(paths.includes('project.godot'));
   assert.ok(paths.includes('scripts/combat_math.gd'));
+  assert.ok(paths.includes('scripts/arena_controller.gd'));
   assert.ok(paths.includes('scripts/player_controller.gd'));
   assert.ok(paths.includes('scripts/hud_controller.gd'));
+  assert.ok(paths.includes('shaders/anamorphic_glow.gdshader'));
+  assert.ok(paths.includes('scripts/vfx_pool.gd'));
+  assert.ok(paths.includes('scripts/domain_generator.gd'));
+  assert.ok(paths.includes('scripts/audio_manager.gd'));
+  assert.ok(paths.includes('scripts/save_manager.gd'));
   assert.ok(paths.includes('scenes/main_arena.tscn'));
   assert.ok(paths.includes('README.md'));
+  const sceneFile = files.find((f) => f.path === 'scenes/main_arena.tscn');
+  assert.ok(sceneFile?.content.includes('arena_controller.gd'));
+  assert.ok(sceneFile?.content.includes('OverlayRoot'));
   for (const f of files) {
     assert.ok(f.content.length > 50, `Expected non-empty content for ${f.path}`);
   }

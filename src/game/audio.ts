@@ -58,6 +58,21 @@ class SoundEngine {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + (isCrit ? 0.16 : 0.1));
+
+    // Layered impact thud / harmonic shimmer on crits
+    if (isCrit) {
+      const sub = ctx.createOscillator();
+      const subGain = ctx.createGain();
+      sub.type = 'sine';
+      sub.frequency.setValueAtTime(110, now);
+      sub.frequency.exponentialRampToValueAtTime(42, now + 0.16);
+      subGain.gain.setValueAtTime(0.1, now);
+      subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.17);
+      sub.connect(subGain);
+      subGain.connect(ctx.destination);
+      sub.start(now);
+      sub.stop(now + 0.18);
+    }
   }
 
   public playDash() {
@@ -118,6 +133,26 @@ class SoundEngine {
     });
   }
 
+  public playChamberClear() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const freqs = [392.0, 493.88, 587.33];
+    freqs.forEach((f, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      const t = now + idx * 0.07;
+      osc.frequency.setValueAtTime(f, t);
+      gain.gain.setValueAtTime(0.07, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.32);
+    });
+  }
+
   public playBossTelegraph() {
     const ctx = this.ensureContext();
     if (!ctx) return;
@@ -133,6 +168,25 @@ class SoundEngine {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.4);
+  }
+
+  public playBossPhaseShift() {
+    const ctx = this.ensureContext();
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    [98, 146.83, 220].forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = idx === 0 ? 'sawtooth' : 'triangle';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.05);
+      osc.frequency.exponentialRampToValueAtTime(freq * 1.45, now + 0.45);
+      gain.gain.setValueAtTime(0.09, now + idx * 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.5);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + idx * 0.05);
+      osc.stop(now + 0.52);
+    });
   }
 }
 

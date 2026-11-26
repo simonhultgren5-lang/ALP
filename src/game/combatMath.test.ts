@@ -8,7 +8,14 @@ import {
   computeLifeLeechHeal,
   rollGearDrop,
 } from './combatMath';
-import { SKILLS, createInitialSkillProgress } from './data';
+import {
+  ALL_ASPECT_IDS,
+  ALL_SKILL_IDS,
+  DOMAIN_MODIFIERS,
+  LEGENDARY_TEMPLATES,
+  SKILLS,
+  createInitialSkillProgress,
+} from './data';
 import { GearItem } from './types';
 
 test('aggregateGearStats applies Iron Aspect (+60% more Armour, Cannot Evade)', () => {
@@ -147,4 +154,48 @@ test('Crafting bench and loot generation produce valid items', () => {
   assert.ok(dropped.name.length > 0);
   const crafted = applyCraftingBench(dropped, 'add_life');
   assert.equal(crafted.mods.maxLife, (dropped.mods.maxLife || 0) + 28);
+});
+
+test('Phase 4 roster expansion meets target counts (18 skills, 25 aspects, 12 legendaries, 15 domain mods)', () => {
+  assert.equal(ALL_SKILL_IDS.length, 18);
+  assert.equal(ALL_ASPECT_IDS.length, 25);
+  assert.equal(LEGENDARY_TEMPLATES.length, 12);
+  assert.equal(DOMAIN_MODIFIERS.length, 15);
+});
+
+test('Phase 4 Aspects apply Glass Cannon, Chronomancer, Bastion, Frostbite, and Harvester rules', () => {
+  const base = aggregateGearStats({}, [], 10);
+  const gc = aggregateGearStats({}, ['glass_cannon'], 10);
+  assert.equal(gc.maxLife, Math.round(base.maxLife * 0.75));
+  assert.equal(gc.maxEnergyShield, Math.round(base.maxEnergyShield * 0.75));
+
+  const chrono = aggregateGearStats({}, ['chronomancer'], 10);
+  assert.equal(chrono.cooldownRecoveryMult, 0.8);
+  assert.equal(chrono.maxLife, Math.round(base.maxLife * 0.85));
+
+  const bastion = aggregateGearStats({}, ['bastion'], 10);
+  assert.equal(bastion.fireRes, 15);
+  assert.equal(bastion.armour, Math.round(base.armour * 1.35));
+
+  const harvester = aggregateGearStats({}, ['harvester'], 10);
+  assert.equal(harvester.killLifeGain, 8);
+  assert.equal(harvester.killManaGain, 8);
+
+  const progress = createInitialSkillProgress();
+  const frostStats = aggregateGearStats({}, ['frostbite'], 1);
+  const coldVsChilled = calculateSkillDamage({
+    skill: SKILLS.glacial_cascade,
+    skillProgress: progress.glacial_cascade,
+    stats: frostStats,
+    activeAspects: ['frostbite'],
+    isMovementEmpowered: false,
+    isEclipseEmpowered: false,
+    isDistantTarget: false,
+    isLowLife: false,
+    isTargetChilled: true,
+    isCrit: false,
+    enemyResistPct: 0,
+    enemyArmour: 0,
+  });
+  assert.equal(coldVsChilled.finalDamage, Math.round(SKILLS.glacial_cascade.baseDamage * 1.35));
 });

@@ -1,0 +1,15 @@
+{
+  "models": {
+    "player": "/models/knight.glb",
+    "boss": "/models/skeleton_warrior.glb",
+    "thrall": "/models/skeleton_minion.glb",
+    "cultist": "/models/skeleton_mage.glb",
+    "charger": "/models/barbarian.glb",
+    "stalker": "/models/skeleton_rogue.glb"
+  },
+  "props": {
+    "pillar": "/models/pillar_decorated.glb",
+    "torch": "/models/torch_lit.glb",
+    "wall": "/models/wall_arched.glb"
+  }
+}

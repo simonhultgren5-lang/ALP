@@ -39,6 +39,8 @@ const BOSS_NAMES = [
   'Vaelor, The Ashen Sovereign',
   'Malkor, Storm Warden',
   'Sera, Frostbound Oracle',
+  'Nyx, Architect of the Void',
+  'Kaelen, Iron Colossus',
 ];
 
 const ROOM_TITLES = [
