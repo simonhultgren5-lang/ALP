@@ -15,7 +15,13 @@ export type ModelSlotId =
 
 export type PropSlotId = 'pillar' | 'torch' | 'wall';
 
-export type AnimIntent = 'idle' | 'move' | 'attack' | 'windup' | 'death';
+export type AnimIntent =
+  | 'idle'
+  | 'move'
+  | 'attack'
+  | 'windup'
+  | 'hit'
+  | 'death';
 
 export interface CustomModelStatus {
   slot: ModelSlotId;
@@ -45,9 +51,26 @@ export interface CustomRigInstance {
   root: THREE.Group;
   hasClips: boolean;
   setAnimationState: (intent: AnimIntent, speedScale?: number) => void;
+  /** Short hit-react / stagger. Returns false if no hit clip exists. */
+  playHitReact: (strength?: number) => boolean;
+  /** Force death pose (one-shot, clamped). */
+  playDeath: () => void;
+  /** Procedural upper-body / head look-at target in world space (or null to clear). */
+  setLookAt: (worldTarget: THREE.Vector3 | null) => void;
+  /** Enable/disable foot IK and optionally set ground Y height. */
+  setFootIK: (enabled: boolean, groundY?: number) => void;
   setTint: (emissiveHex: number, emissiveIntensity: number) => void;
   update: (dt: number) => void;
   dispose: () => void;
+}
+
+/** Simple two-bone IK chain (upper → lower → end). */
+interface IKChain {
+  upper: THREE.Bone;
+  lower: THREE.Bone;
+  end: THREE.Bone; // foot / ankle
+  upperLen: number;
+  lowerLen: number;
 }
 
 export const MODEL_SLOT_META: Record<
@@ -110,6 +133,167 @@ function matchClipForIntent(
     if (found) return found;
   }
   return undefined;
+}
+
+// ─── Two-Bone IK ─────────────────────────────────────────────────────────────
+
+const _ikUpperPos = new THREE.Vector3();
+const _ikLowerPos = new THREE.Vector3();
+const _ikEndPos = new THREE.Vector3();
+const _ikTarget = new THREE.Vector3();
+const _ikMid = new THREE.Vector3();
+const _ikDir = new THREE.Vector3();
+const _ikOrtho = new THREE.Vector3();
+const _ikQuat = new THREE.Quaternion();
+const _ikQuat2 = new THREE.Quaternion();
+const _ikParentWorld = new THREE.Quaternion();
+const _ikInvParent = new THREE.Quaternion();
+const _ikUp = new THREE.Vector3(0, 1, 0);
+
+/**
+ * Analytic two-bone IK.
+ * Places `end` at `target` by rotating `upper` and `lower`.
+ * Prefer pole direction keeps the knee bending forward.
+ */
+function solveTwoBoneIK(
+  upper: THREE.Bone,
+  lower: THREE.Bone,
+  end: THREE.Bone,
+  upperLen: number,
+  lowerLen: number,
+  targetWorld: THREE.Vector3,
+  poleDirWorld: THREE.Vector3
+) {
+  upper.getWorldPosition(_ikUpperPos);
+  lower.getWorldPosition(_ikLowerPos);
+  end.getWorldPosition(_ikEndPos);
+
+  const totalLen = upperLen + lowerLen;
+  _ikDir.subVectors(targetWorld, _ikUpperPos);
+  let dist = _ikDir.length();
+  if (dist < 1e-5) return;
+  // Clamp to reachable range
+  dist = Math.min(dist, totalLen * 0.999);
+  dist = Math.max(dist, Math.abs(upperLen - lowerLen) + 0.001);
+  _ikDir.normalize();
+
+  // Law of cosines – angle at upper joint
+  const cosUpper =
+    (upperLen * upperLen + dist * dist - lowerLen * lowerLen) /
+    (2 * upperLen * dist);
+  const angleUpper = Math.acos(Math.max(-1, Math.min(1, cosUpper)));
+
+  // Build bend plane from target direction + pole
+  _ikOrtho.copy(poleDirWorld).sub(_ikDir.clone().multiplyScalar(poleDirWorld.dot(_ikDir)));
+  if (_ikOrtho.lengthSq() < 1e-6) {
+    _ikOrtho.crossVectors(_ikDir, _ikUp);
+    if (_ikOrtho.lengthSq() < 1e-6) _ikOrtho.set(1, 0, 0);
+  }
+  _ikOrtho.normalize();
+
+  // Mid joint position
+  const midDist = Math.cos(angleUpper) * upperLen;
+  const midOffset = Math.sin(angleUpper) * upperLen;
+  _ikMid
+    .copy(_ikUpperPos)
+    .addScaledVector(_ikDir, midDist)
+    .addScaledVector(_ikOrtho, midOffset);
+
+  // --- Rotate upper bone so it points at mid ---
+  if (upper.parent) {
+    upper.parent.getWorldQuaternion(_ikParentWorld);
+  } else {
+    _ikParentWorld.identity();
+  }
+  _ikInvParent.copy(_ikParentWorld).invert();
+
+  // Desired upper direction in world
+  const upperDesired = _ikMid.clone().sub(_ikUpperPos).normalize();
+  // Current upper direction in world
+  const upperCurrent = _ikLowerPos.clone().sub(_ikUpperPos).normalize();
+  _ikQuat.setFromUnitVectors(upperCurrent, upperDesired);
+  // Apply delta in parent space
+  upper.quaternion
+    .copy(_ikInvParent)
+    .multiply(_ikQuat)
+    .multiply(_ikParentWorld)
+    .multiply(upper.quaternion)
+    .normalize();
+
+  // Refresh lower world pos after upper rotation
+  upper.updateMatrixWorld(true);
+  lower.getWorldPosition(_ikLowerPos);
+
+  // --- Rotate lower bone so it points at target ---
+  if (lower.parent) {
+    lower.parent.getWorldQuaternion(_ikParentWorld);
+  } else {
+    _ikParentWorld.identity();
+  }
+  _ikInvParent.copy(_ikParentWorld).invert();
+
+  const lowerDesired = targetWorld.clone().sub(_ikLowerPos).normalize();
+  end.getWorldPosition(_ikEndPos);
+  const lowerCurrent = _ikEndPos.clone().sub(_ikLowerPos).normalize();
+  if (lowerCurrent.lengthSq() > 1e-8 && lowerDesired.lengthSq() > 1e-8) {
+    _ikQuat2.setFromUnitVectors(lowerCurrent.normalize(), lowerDesired);
+    lower.quaternion
+      .copy(_ikInvParent)
+      .multiply(_ikQuat2)
+      .multiply(_ikParentWorld)
+      .multiply(lower.quaternion)
+      .normalize();
+  }
+}
+
+function findBoneByPatterns(
+  root: THREE.Object3D,
+  patterns: RegExp[]
+): THREE.Bone | null {
+  let found: THREE.Bone | null = null;
+  root.traverse((obj) => {
+    if (found) return;
+    if ((obj as THREE.Bone).isBone) {
+      const n = obj.name;
+      for (const p of patterns) {
+        if (p.test(n)) {
+          found = obj as THREE.Bone;
+          return;
+        }
+      }
+    }
+  });
+  return found;
+}
+
+function buildLegChain(
+  root: THREE.Object3D,
+  side: 'left' | 'right'
+): IKChain | null {
+  const L = side === 'left';
+  const upper = findBoneByPatterns(root, L
+    ? [/leftupleg/i, /left_upper_leg/i, /l_upperleg/i, /mixamorigleftupleg/i, /thigh_l/i, /upperleg_l/i, /l.?thigh/i]
+    : [/rightupleg/i, /right_upper_leg/i, /r_upperleg/i, /mixamorigrightupleg/i, /thigh_r/i, /upperleg_r/i, /r.?thigh/i]
+  );
+  const lower = findBoneByPatterns(root, L
+    ? [/leftleg/i, /left_lower_leg/i, /l_lowerleg/i, /mixamorigleftleg/i, /calf_l/i, /lowerleg_l/i, /l.?calf/i, /leftshin/i]
+    : [/rightleg/i, /right_lower_leg/i, /r_lowerleg/i, /mixamorigrightleg/i, /calf_r/i, /lowerleg_r/i, /r.?calf/i, /rightshin/i]
+  );
+  const foot = findBoneByPatterns(root, L
+    ? [/leftfoot/i, /left_foot/i, /l_foot/i, /mixamorigleftfoot/i, /foot_l/i, /l.?foot/i, /leftankle/i]
+    : [/rightfoot/i, /right_foot/i, /r_foot/i, /mixamorigrightfoot/i, /foot_r/i, /r.?foot/i, /rightankle/i]
+  );
+
+  if (!upper || !lower || !foot) return null;
+
+  upper.getWorldPosition(_ikUpperPos);
+  lower.getWorldPosition(_ikLowerPos);
+  foot.getWorldPosition(_ikEndPos);
+  const upperLen = _ikUpperPos.distanceTo(_ikLowerPos);
+  const lowerLen = _ikLowerPos.distanceTo(_ikEndPos);
+  if (upperLen < 0.01 || lowerLen < 0.01) return null;
+
+  return { upper, lower, end: foot, upperLen, lowerLen };
 }
 
 function buildClipMap(
@@ -195,7 +379,42 @@ function buildClipMap(
     /fall/i,
   ]);
 
-  return { idle, move, attack, windup, death };
+  const hit = matchClipForIntent(clips, [
+    /^Hit_A$/i,
+    /^Hit_B$/i,
+    /^HitReact/i,
+    /hitreact/i,
+    /hit_react/i,
+    /flinch/i,
+    /stagger/i,
+    /hurt/i,
+    /damage/i,
+    /gethit/i,
+    /impact/i,
+  ]);
+
+  // Strip root motion on locomotion/attack clips so the game controls position
+  for (const clip of [idle, move, attack, windup, hit, death]) {
+    if (!clip) continue;
+    for (const track of clip.tracks) {
+      if (
+        track.name.endsWith('Hips.position') ||
+        track.name.endsWith('mixamorigHips.position') ||
+        track.name.endsWith('Root.position') ||
+        track.name.endsWith('root.position')
+      ) {
+        const values = (track as THREE.VectorKeyframeTrack).values;
+        // Keep only the Y (height) channel, zero out X/Z sliding
+        for (let i = 0; i < values.length; i += 3) {
+          values[i] = 0;     // X
+          // values[i+1] stays (Y)
+          values[i + 2] = 0; // Z
+        }
+      }
+    }
+  }
+
+  return { idle, move, attack, windup, hit, death };
 }
 
 function countTriangles(root: THREE.Object3D): number {
@@ -609,13 +828,23 @@ export class GltfModelRegistry {
       asset.clips.length > 0 ? new THREE.AnimationMixer(root) : null;
     const actions: Partial<Record<AnimIntent, THREE.AnimationAction>> = {};
     if (mixer) {
-      for (const intent of ['idle', 'move', 'attack', 'windup', 'death'] as const) {
+      for (const intent of [
+        'idle',
+        'move',
+        'attack',
+        'windup',
+        'hit',
+        'death',
+      ] as const) {
         const clip = asset.clipMap[intent];
         if (clip) {
           const action = mixer.clipAction(clip);
-          if (intent === 'attack' || intent === 'death') {
+          if (intent === 'attack' || intent === 'hit') {
             action.loop = THREE.LoopOnce;
-            action.clampWhenFinished = intent === 'death';
+            action.clampWhenFinished = false;
+          } else if (intent === 'death') {
+            action.loop = THREE.LoopOnce;
+            action.clampWhenFinished = true;
           } else {
             action.loop = THREE.LoopRepeat;
           }
@@ -626,31 +855,162 @@ export class GltfModelRegistry {
 
     let currentIntent: AnimIntent | null = null;
     let currentAction: THREE.AnimationAction | null = null;
+    let isDead = false;
+    let hitReactTimer = 0;
+
+    // Bones for procedural look-at + foot IK
+    let headBone: THREE.Bone | null = null;
+    let spineBone: THREE.Bone | null = null;
+    root.traverse((obj) => {
+      if ((obj as THREE.Bone).isBone) {
+        const name = obj.name.toLowerCase();
+        if (!headBone && (name.includes('head') || name === 'mixamorighead')) {
+          headBone = obj as THREE.Bone;
+        }
+        if (
+          !spineBone &&
+          (name.includes('spine2') ||
+            name.includes('spine1') ||
+            name.includes('chest') ||
+            name === 'mixamorigspine2')
+        ) {
+          spineBone = obj as THREE.Bone;
+        }
+      }
+    });
+
+    // Build leg IK chains (left / right)
+    const leftLeg = buildLegChain(root, 'left');
+    const rightLeg = buildLegChain(root, 'right');
+    let footIKEnabled = !!(leftLeg || rightLeg);
+    let groundY = 0;
+    const footHeightOffset = 0.02; // small lift so soles sit on ground
+    const _footTarget = new THREE.Vector3();
+    const _poleFwd = new THREE.Vector3();
+    const _rootFwd = new THREE.Vector3();
+
+    // Pelvis / hips bone for height adjustment
+    const hipsBone = findBoneByPatterns(root, [
+      /mixamorighips/i,
+      /^hips$/i,
+      /^pelvis$/i,
+      /hip/i,
+      /pelvis/i,
+      /^root$/i,
+    ]);
+    // Rest-pose hip height above ground (measured once after first pose)
+    let hipsRestHeight = -1;
+    let pelvisAdjustEnabled = footIKEnabled && !!hipsBone;
+    const pelvisSmooth = { current: 0 }; // smoothed downward offset
+    const maxPelvisDrop = 0.22; // don't compress more than this
+    const _hipsWorld = new THREE.Vector3();
+    const _footL = new THREE.Vector3();
+    const _footR = new THREE.Vector3();
+
+    const lookAtTarget = new THREE.Vector3();
+    let hasLookAt = false;
+    const _lookDir = new THREE.Vector3();
+    const _boneWorld = new THREE.Vector3();
+    const _q = new THREE.Quaternion();
+    const _qTarget = new THREE.Quaternion();
+
     if (actions.idle) {
       actions.idle.play();
       currentIntent = 'idle';
       currentAction = actions.idle;
     }
 
+    const FADE = {
+      idle: 0.22,
+      move: 0.18,
+      attack: 0.12,
+      windup: 0.14,
+      hit: 0.08,
+      death: 0.2,
+    } as const;
+
     const setAnimationState = (intent: AnimIntent, speedScale = 1) => {
-      if (!mixer) return;
+      if (!mixer || isDead) return;
+      // Don't interrupt an active hit-react unless going to death/attack
+      if (hitReactTimer > 0 && intent !== 'death' && intent !== 'attack') {
+        return;
+      }
       const target = actions[intent] ?? actions.idle;
       if (!target) return;
       target.timeScale = speedScale;
+
       if (currentIntent === intent && currentAction === target) {
-        if (intent === 'attack' && !target.isRunning()) {
+        // Re-trigger one-shots
+        if (
+          (intent === 'attack' || intent === 'hit') &&
+          !target.isRunning()
+        ) {
           target.reset().play();
         }
         return;
       }
+
+      const fade = FADE[intent] ?? 0.16;
       target.enabled = true;
       target.reset();
+      target.setEffectiveWeight(1);
       target.play();
       if (currentAction && currentAction !== target) {
-        currentAction.crossFadeTo(target, 0.14, true);
+        currentAction.crossFadeTo(target, fade, true);
       }
       currentIntent = intent;
       currentAction = target;
+    };
+
+    const playHitReact = (strength = 1) => {
+      if (!mixer || isDead || !actions.hit) return false;
+      const action = actions.hit;
+      action.reset();
+      action.setEffectiveWeight(Math.min(1, 0.65 + strength * 0.35));
+      action.timeScale = 1.1 + strength * 0.25;
+      action.play();
+      if (currentAction && currentAction !== action) {
+        currentAction.crossFadeTo(action, 0.07, true);
+      }
+      currentAction = action;
+      currentIntent = 'hit';
+      hitReactTimer = 0.28 + strength * 0.12;
+      return true;
+    };
+
+    const playDeath = () => {
+      if (!mixer) return;
+      isDead = true;
+      hitReactTimer = 0;
+      const deathAction = actions.death;
+      if (deathAction) {
+        deathAction.reset();
+        deathAction.setEffectiveWeight(1);
+        deathAction.play();
+        if (currentAction && currentAction !== deathAction) {
+          currentAction.crossFadeTo(deathAction, 0.18, true);
+        }
+        currentAction = deathAction;
+        currentIntent = 'death';
+      } else {
+        // Fallback: freeze current pose
+        mixer.stopAllAction();
+      }
+    };
+
+    const setLookAt = (worldTarget: THREE.Vector3 | null) => {
+      if (worldTarget) {
+        lookAtTarget.copy(worldTarget);
+        hasLookAt = true;
+      } else {
+        hasLookAt = false;
+      }
+    };
+
+    const setFootIK = (enabled: boolean, y?: number) => {
+      footIKEnabled = enabled && !!(leftLeg || rightLeg);
+      pelvisAdjustEnabled = footIKEnabled && !!hipsBone;
+      if (typeof y === 'number') groundY = y;
     };
 
     const setTint = (emissiveHex: number, emissiveIntensity: number) => {
@@ -660,13 +1020,113 @@ export class GltfModelRegistry {
       }
     };
 
+    const applyFootIK = (chain: IKChain) => {
+      // Current foot world position from animation
+      chain.end.getWorldPosition(_footTarget);
+      // Project onto ground plane, keep XZ from anim, lock Y
+      _footTarget.y = groundY + footHeightOffset;
+
+      // Pole vector = character forward (knee bends forward)
+      root.getWorldDirection(_rootFwd);
+      _poleFwd.set(_rootFwd.x, 0, _rootFwd.z).normalize();
+      if (_poleFwd.lengthSq() < 1e-6) _poleFwd.set(0, 0, 1);
+
+      solveTwoBoneIK(
+        chain.upper,
+        chain.lower,
+        chain.end,
+        chain.upperLen,
+        chain.lowerLen,
+        _footTarget,
+        _poleFwd
+      );
+    };
+
+    /**
+     * Pelvis adjustment:
+     * After animation, measure how far feet are above/below ground.
+     * Shift hips down so the lowest foot can reach the ground without
+     * over-stretching the legs. Smoothed to avoid jitter.
+     */
+    const applyPelvisAdjustment = (dt: number) => {
+      if (!hipsBone || !pelvisAdjustEnabled) return;
+
+      root.updateMatrixWorld(true);
+      hipsBone.getWorldPosition(_hipsWorld);
+
+      // Capture rest height once (first frame we have a valid pose)
+      if (hipsRestHeight < 0) {
+        hipsRestHeight = _hipsWorld.y - groundY;
+        if (hipsRestHeight < 0.3) hipsRestHeight = 0.9; // sane fallback
+      }
+
+      // Where do the animated feet sit?
+      let lowestFootY = Infinity;
+      if (leftLeg) {
+        leftLeg.end.getWorldPosition(_footL);
+        lowestFootY = Math.min(lowestFootY, _footL.y);
+      }
+      if (rightLeg) {
+        rightLeg.end.getWorldPosition(_footR);
+        lowestFootY = Math.min(lowestFootY, _footR.y);
+      }
+      if (!isFinite(lowestFootY)) return;
+
+      // How much do we need to drop the pelvis so the lowest foot reaches ground?
+      const desiredFootY = groundY + footHeightOffset;
+      const footError = lowestFootY - desiredFootY; // >0 = feet floating
+      // Only pull hips down (never push up) – clamp to maxPelvisDrop
+      const targetDrop = Math.max(0, Math.min(maxPelvisDrop, footError));
+
+      // Smooth the offset
+      const smooth = 1 - Math.exp(-12 * dt);
+      pelvisSmooth.current += (targetDrop - pelvisSmooth.current) * smooth;
+
+      if (pelvisSmooth.current > 0.0005) {
+        // Apply as local Y translation on hips bone
+        hipsBone.position.y -= pelvisSmooth.current;
+        // Note: we subtract every frame from the mixer-authored position,
+        // so we must re-apply relative to the just-updated animated value.
+        // Because mixer overwrites position each frame, a plain -= is correct.
+      }
+    };
+
     return {
       root,
       hasClips: asset.clips.length > 0,
       setAnimationState,
+      playHitReact,
+      playDeath,
+      setLookAt,
+      setFootIK,
       setTint,
       update: (dt: number) => {
+        if (hitReactTimer > 0) {
+          hitReactTimer = Math.max(0, hitReactTimer - dt);
+        }
         mixer?.update(dt);
+
+        // 1) Pelvis first – lower hips so legs can reach the ground
+        // 2) Then foot IK – plant feet
+        if (footIKEnabled && !isDead) {
+          applyPelvisAdjustment(dt);
+          root.updateMatrixWorld(true);
+          if (leftLeg) applyFootIK(leftLeg);
+          if (rightLeg) applyFootIK(rightLeg);
+        }
+
+        // Procedural upper-body / head look-at (applied after mixer + IK)
+        if (hasLookAt && (headBone || spineBone)) {
+          const bone = headBone ?? spineBone!;
+          bone.getWorldPosition(_boneWorld);
+          _lookDir.subVectors(lookAtTarget, _boneWorld).normalize();
+          const yaw = Math.atan2(_lookDir.x, _lookDir.z);
+          const pitch = Math.asin(
+            Math.max(-0.35, Math.min(0.35, -_lookDir.y))
+          );
+          _qTarget.setFromEuler(new THREE.Euler(pitch * 0.6, yaw * 0.45, 0, 'YXZ'));
+          bone.quaternion.slerp(_qTarget, 1 - Math.exp(-8 * dt));
+        }
       },
       dispose: () => {
         mixer?.stopAllAction();

@@ -137,6 +137,8 @@ export interface ItemMods {
   coldResPct?: number;
   lightningResPct?: number;
   chaosResPct?: number;
+  /** Status effect resistance (0–100). Reduces duration of statuses applied to the player. */
+  statusResistPct?: number;
   skillLevelBonus?: number;
 }
 
@@ -187,6 +189,8 @@ export interface ComputedPlayerStats {
   coldRes: number;
   lightningRes: number;
   chaosRes: number;
+  /** 0–100. Reduces duration of status effects applied to the player. */
+  statusResistPct: number;
   chillEffectMult: number;
   veilShieldMax: number;
   veilCooldown: number;

@@ -37,6 +37,7 @@ export function aggregateGearStats(
   let coldRes = 0;
   let lightningRes = 0;
   let chaosRes = 0;
+  let statusResistPct = 0;
   let skillLevelBonus = 0;
 
   const activeMarksSet = new Set<MarkId>();
@@ -60,6 +61,7 @@ export function aggregateGearStats(
     if (m.coldResPct) coldRes += m.coldResPct;
     if (m.lightningResPct) lightningRes += m.lightningResPct;
     if (m.chaosResPct) chaosRes += m.chaosResPct;
+    if (m.statusResistPct) statusResistPct += m.statusResistPct;
     if (m.skillLevelBonus) skillLevelBonus += m.skillLevelBonus;
     if (item.markId) activeMarksSet.add(item.markId);
     if (item.legendaryId) activeLegendaries.push(item.legendaryId);
@@ -207,6 +209,7 @@ export function aggregateGearStats(
     coldRes: Math.min(75, coldRes),
     lightningRes: Math.min(75, lightningRes),
     chaosRes: Math.min(75, chaosRes),
+    statusResistPct: Math.min(75, Math.max(0, statusResistPct)),
     chillEffectMult,
     veilShieldMax: hasAspect('veil') ? Math.round(maxLife * 0.22 + 40) : 0,
     veilCooldown: 7,
@@ -254,6 +257,10 @@ export function calculateSkillDamage(input: DamageCalculationInput): DamageCalcu
 
   if (skill.id === 'cinder_slash' && c5 === 'A') {
     baseDamage *= 1.15;
+  }
+  // Colossus Impact (Seismic Slam Lv15 A) — 10% of Armour as flat damage
+  if (skill.id === 'seismic_slam' && c15 === 'A') {
+    baseDamage += Math.round(stats.armour * 0.1);
   }
 
   // 2. + Flat added damage
@@ -516,6 +523,7 @@ export function rollGearDrop(
     () => (mods.fireResPct = (mods.fireResPct || 0) + Math.round(10 + rng() * 12)),
     () => (mods.coldResPct = (mods.coldResPct || 0) + Math.round(10 + rng() * 12)),
     () => (mods.lightningResPct = (mods.lightningResPct || 0) + Math.round(10 + rng() * 12)),
+    () => (mods.statusResistPct = (mods.statusResistPct || 0) + Math.round(8 + rng() * 10)),
   ];
 
   for (let i = 0; i < modCount; i++) {
@@ -552,6 +560,7 @@ export function applyCraftingBench(item: GearItem, action: BenchCraftAction): Ge
     updated.mods.fireResPct = (updated.mods.fireResPct || 0) + 12;
     updated.mods.coldResPct = (updated.mods.coldResPct || 0) + 12;
     updated.mods.lightningResPct = (updated.mods.lightningResPct || 0) + 12;
+    updated.mods.statusResistPct = (updated.mods.statusResistPct || 0) + 8;
   } else if (action === 'upgrade_tier') {
     updated.modTier = Math.min(5, updated.modTier + 1);
     if (updated.mods.flatDamage) updated.mods.flatDamage = Math.round(updated.mods.flatDamage * 1.18);

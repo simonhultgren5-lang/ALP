@@ -136,6 +136,8 @@ interface Enemy {
   damage: number;
   armour: number;
   resistPct: number;
+  /** 0–100. Reduces duration of applied status effects. */
+  statusResistPct: number;
   isElite: boolean;
   hitFlash: number;
   koTimer: number; // > 0 when dying
@@ -200,6 +202,12 @@ export class AshenEngine {
   private simTime = 0;
   private hitstopTimer = 0;
   private trauma = 0;
+  private screenFlash = 0; // 0–1, decays each frame – used for crit/kill flash
+  private screenFlashColor = '#FFF7ED';
+  /** 0–1 FOV kick strength; renderer lerps camera.fov from this */
+  private fovKick = 0;
+  /** +1 zoom-in (crit/kill), -1 widen (player hurt) */
+  private fovKickSign = 1;
   private hudSyncTimer = 0;
   private needsStaticRedraw = true;
 
@@ -294,6 +302,49 @@ export class AshenEngine {
   private critMomentumTimer = 0;
   private barrierTimer = 0;
   private fleetfootTimer = 0;
+  // Twin Spin (Crimson Whirlwind Lv15 B) — delayed second cleave
+  private twinSpinTimer = 0;
+  private twinSpinParams: {
+    x: number;
+    y: number;
+    radius: number;
+    angle: number;
+    isShadeEmpowered: boolean;
+    isEclipseEmpowered: boolean;
+  } | null = null;
+  // Seismic Slam delayed effects (Aftershock / Double Rupture)
+  private seismicDelayTimer = 0;
+  private seismicDelayParams: {
+    x: number;
+    y: number;
+    radius: number;
+    damageMult: number;
+    isShadeEmpowered: boolean;
+    isEclipseEmpowered: boolean;
+    isDoubleRupture: boolean;
+  } | null = null;
+  // Eclipse Cleave (Cinder Slash Lv15 B) — delayed second slash
+  private eclipseCleaveTimer = 0;
+  private eclipseCleaveParams: {
+    x: number;
+    y: number;
+    angle: number;
+    arc: number;
+    radius: number;
+    isShadeEmpowered: boolean;
+    isEclipseEmpowered: boolean;
+  } | null = null;
+  // Double Eruption (Ashen Nova Lv15 B) — delayed second nova
+  private doubleEruptionTimer = 0;
+  private doubleEruptionParams: {
+    x: number;
+    y: number;
+    radius: number;
+    isShadeEmpowered: boolean;
+    isEclipseEmpowered: boolean;
+  } | null = null;
+  // Burn floating number throttle
+  private burnTextTimer = 0;
   private regrowthBank = 0;
 
   // Run telemetry
@@ -867,6 +918,7 @@ export class AshenEngine {
         damage: 0,
         armour: 0,
         resistPct: 0,
+        statusResistPct: 0,
         isElite: false,
         hitFlash: 0,
         koTimer: 0,
@@ -903,6 +955,7 @@ export class AshenEngine {
         damage: 0,
         armour: this.sanctuaryConfig.dummyArmour,
         resistPct: this.sanctuaryConfig.dummyResistPct,
+        statusResistPct: 0,
         isElite: true,
         hitFlash: 0,
         koTimer: 0,
@@ -978,6 +1031,14 @@ export class AshenEngine {
     this.groundLoot = [];
     this.slashEffects = [];
     this.lightningEffects = [];
+    this.twinSpinTimer = 0;
+    this.twinSpinParams = null;
+    this.seismicDelayTimer = 0;
+    this.seismicDelayParams = null;
+    this.eclipseCleaveTimer = 0;
+    this.eclipseCleaveParams = null;
+    this.doubleEruptionTimer = 0;
+    this.doubleEruptionParams = null;
     this.decals.forEach((d) => (d.active = false));
     this.enemies = [];
 
@@ -1039,6 +1100,7 @@ export class AshenEngine {
           damage: Math.round(baseDmg * tierDmgScale * modDmg * (sp.isElite && !isBoss ? 1.25 : 1)),
           armour: isBoss ? 80 + tier * 15 : sp.archetype === 'charger' ? 45 + tier * 8 : 15 + tier * 4,
           resistPct: Math.min(50, tier * 2),
+          statusResistPct: isBoss ? 65 : sp.isElite ? 30 : Math.min(15, tier * 1.5),
           isElite: sp.isElite,
           hitFlash: 0,
           koTimer: 0,
@@ -1346,6 +1408,15 @@ export class AshenEngine {
         this.pEs = Math.min(this.stats.maxEnergyShield, this.pEs + Math.round(this.stats.maxEnergyShield * 0.35));
       }
       this.burstParticles(this.px, this.py, '#38BDF8', 22, 'outer');
+      // Blinding Ward (Lv10 B) — slow nearby attackers
+      if (prog.choices[10] === 'B') {
+        for (const e of this.enemies) {
+          if (e.koTimer > 0) continue;
+          if (Math.hypot(e.x - this.px, e.y - this.py) <= 160) {
+            this.applyStatus(e, 'chill', 2.0, 0.3);
+          }
+        }
+      }
       this.recomputeStats(false);
       return;
     }
@@ -1392,15 +1463,35 @@ export class AshenEngine {
           if (Math.abs(diff) <= arc * 0.58 || dist < 42) {
             this.applyHitToEnemy(enemy, skillId, isShadeEmpowered, isEclipseEmpowered, false, Math.cos(angle) * 140, Math.sin(angle) * 140);
             if (prog.choices[5] === 'A' || prog.choices[10] === 'B') {
+              // Skill-level scaled burn (improved)
+              const scaledBurn = Math.round((12 + prog.level * 3.5) * this.stats.burnMagnitudeMult);
               enemy.burnTimer = 2.5;
-              enemy.burnDps = Math.max(enemy.burnDps, 14 + prog.level * 4);
+              enemy.burnDps = Math.max(enemy.burnDps, scaledBurn);
             }
           }
         }
       }
+      // Eclipse Cleave (Lv15 B) — delayed second slash
+      if (prog.choices[15] === 'B') {
+        this.eclipseCleaveTimer = 0.2;
+        this.eclipseCleaveParams = {
+          x: this.px,
+          y: this.py,
+          angle: angle + Math.PI * 0.4,
+          arc,
+          radius: radius * 1.05,
+          isShadeEmpowered,
+          isEclipseEmpowered,
+        };
+      }
       this.pScaleX = 1.18;
       this.pScaleY = 0.84;
-      this.burstParticles(this.px + Math.cos(angle) * 55, this.py + Math.sin(angle) * 55, color, 14, 'spark');
+      this.burstDamageVfx(
+        this.px + Math.cos(angle) * 55,
+        this.py + Math.sin(angle) * 55,
+        'fire',
+        0.9
+      );
       return;
     }
 
@@ -1424,8 +1515,19 @@ export class AshenEngine {
       }
       this.pScaleX = 1.22;
       this.pScaleY = 0.80;
-      this.burstParticles(this.px, this.py, color, 26, 'outer');
+      this.burstDamageVfx(this.px, this.py, 'fire', 1.35);
       this.addTrauma(0.28);
+      // Double Eruption (Lv15 B) — delayed second nova
+      if (prog.choices[15] === 'B') {
+        this.doubleEruptionTimer = 0.3;
+        this.doubleEruptionParams = {
+          x: this.px,
+          y: this.py,
+          radius: radius * 0.72,
+          isShadeEmpowered,
+          isEclipseEmpowered,
+        };
+      }
       return;
     }
 
@@ -1446,13 +1548,29 @@ export class AshenEngine {
       this.spawnDecal(slamX, slamY, radius * 0.75, 3.5, '#94A3B8', 'crack');
       const hits = this.damageEnemiesInRadius(slamX, slamY, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
       for (const e of hits) {
-        if (prog.choices[5] === 'B') e.stunTimer = Math.max(e.stunTimer, 0.85);
+        if (prog.choices[5] === 'B') this.applyStatus(e, 'stun', 0.85);
         if (prog.choices[10] === 'B') e.armour = Math.max(0, Math.round(e.armour * 0.8));
       }
       this.pScaleX = 1.24;
       this.pScaleY = 0.78;
       this.burstParticles(slamX, slamY, '#E2E8F0', 22, 'spark');
+      this.burstDamageVfx(slamX, slamY, 'physical', 1.1);
       this.addTrauma(0.35);
+
+      // Aftershock (Lv5 C) — 60% damage follow-up
+      // Double Rupture (Lv15 B) — cascading larger ring
+      if (prog.choices[5] === 'C' || prog.choices[15] === 'B') {
+        this.seismicDelayTimer = prog.choices[15] === 'B' ? 0.22 : 0.16;
+        this.seismicDelayParams = {
+          x: slamX,
+          y: slamY,
+          radius: prog.choices[15] === 'B' ? radius * 1.35 : radius * 0.85,
+          damageMult: prog.choices[5] === 'C' ? 0.6 : 0.75,
+          isShadeEmpowered,
+          isEclipseEmpowered,
+          isDoubleRupture: prog.choices[15] === 'B',
+        };
+      }
       return;
     }
 
@@ -1520,7 +1638,13 @@ export class AshenEngine {
       }
       this.pScaleX = 1.12;
       this.pScaleY = 0.90;
-      this.burstParticles(this.px + Math.cos(angle) * 20, this.py + Math.sin(angle) * 20, color, 8, 'core');
+      // Muzzle flash per damage type
+      this.burstDamageVfx(
+        this.px + Math.cos(angle) * 22,
+        this.py + Math.sin(angle) * 22,
+        skill.damageType,
+        0.7
+      );
       return;
     }
 
@@ -1578,8 +1702,8 @@ export class AshenEngine {
         hitSet.add(curr.id);
         points.push({ x: curr.x, y: curr.y });
         this.applyHitToEnemy(curr, skillId, isShadeEmpowered, isEclipseEmpowered, false, 0, 0);
-        if (prog.choices[5] === 'C') curr.shockTimer = 3.0;
-        if (prog.choices[10] === 'C' && c === 0) curr.stunTimer = Math.max(curr.stunTimer, 0.35);
+        if (prog.choices[5] === 'C') this.applyStatus(curr, 'shock', 3.0);
+        if (prog.choices[10] === 'C' && c === 0) this.applyStatus(curr, 'stun', 0.35);
         this.burstParticles(curr.x, curr.y, color, 9, 'core');
 
         // Find next unhit enemy
@@ -1630,7 +1754,17 @@ export class AshenEngine {
       });
 
       this.spawnDecal(tx, ty, radius, dur, '#A855F7', 'void', calc.finalDamage * 0.9);
-      this.burstParticles(tx, ty, '#A855F7', 20, 'outer');
+      this.burstDamageVfx(tx, ty, 'chaos', 1.2);
+      // Extra tendril wisps along the path
+      for (let t = 0.25; t <= 1; t += 0.25) {
+        this.burstParticles(
+          this.px + (tx - this.px) * t,
+          this.py + (ty - this.py) * t,
+          '#7C3AED',
+          4,
+          'mid'
+        );
+      }
       return;
     }
 
@@ -1668,9 +1802,25 @@ export class AshenEngine {
         }
       }
       if (prog.choices[15] === 'C') this.fleetfootTimer = 1.5;
+
+      // Twin Spin (Lv15 B) — schedule a second cleave
+      if (prog.choices[15] === 'B') {
+        this.twinSpinTimer = 0.18;
+        this.twinSpinParams = {
+          x: this.px,
+          y: this.py,
+          radius,
+          angle: angle + Math.PI * 0.5, // offset so it feels like a continued spin
+          isShadeEmpowered,
+          isEclipseEmpowered,
+        };
+      }
+
       this.pScaleX = 1.2;
       this.pScaleY = 0.82;
       this.burstParticles(this.px, this.py, '#DC2626', 18, 'spark');
+      // Modest impact shake on the first spin
+      this.addTrauma(0.18);
       return;
     }
 
@@ -1797,10 +1947,10 @@ export class AshenEngine {
       const hits = this.damageEnemiesInRadius(this.px, this.py, radius, skillId, isShadeEmpowered, isEclipseEmpowered, false);
       for (const e of hits) {
         if (prog.choices[10] === 'B') {
-          e.chillTimer = Math.max(e.chillTimer, 2.5);
-          e.chillStrength = Math.max(e.chillStrength, 0.35);
+          // Entropy Chill — 35% slow
+          this.applyStatus(e, 'chill', 2.5, 0.35);
         }
-        e.witheredTimer = Math.max(e.witheredTimer, 2.5);
+        this.applyStatus(e, 'wither', 2.5);
       }
       if (prog.choices[5] === 'B' && hits.length > 0) {
         this.pHp = Math.min(this.stats.maxLife, this.pHp + Math.round(this.stats.maxLife * 0.04 * hits.length));
@@ -1933,7 +2083,8 @@ export class AshenEngine {
     skillId: SkillId,
     isShadeEmpowered: boolean,
     isEclipseEmpowered: boolean,
-    forceCrit: boolean
+    forceCrit: boolean,
+    extraDamageMult = 1
   ): Enemy[] {
     const hit: Enemy[] = [];
     for (const e of this.enemies) {
@@ -1944,11 +2095,60 @@ export class AshenEngine {
       if (d <= radius + e.radius) {
         const nx = d > 0 ? dx / d : 1;
         const ny = d > 0 ? dy / d : 0;
-        this.applyHitToEnemy(e, skillId, isShadeEmpowered, isEclipseEmpowered, forceCrit, nx * 130, ny * 130);
+        this.applyHitToEnemy(
+          e,
+          skillId,
+          isShadeEmpowered,
+          isEclipseEmpowered,
+          forceCrit,
+          nx * 130,
+          ny * 130,
+          extraDamageMult
+        );
         hit.push(e);
       }
     }
     return hit;
+  }
+
+  /**
+   * Apply a status effect with status resistance reduction.
+   * Returns the actual duration applied (0 if fully resisted).
+   */
+  private applyStatus(
+    enemy: Enemy,
+    type: 'chill' | 'burn' | 'shock' | 'stun' | 'wither',
+    duration: number,
+    strength?: number
+  ): number {
+    const resist = Math.min(0.9, Math.max(0, enemy.statusResistPct / 100));
+    const actual = duration * (1 - resist);
+    if (actual <= 0.05) return 0;
+
+    switch (type) {
+      case 'chill':
+        enemy.chillTimer = Math.max(enemy.chillTimer, actual);
+        if (strength !== undefined) {
+          enemy.chillStrength = Math.max(enemy.chillStrength, strength * (1 - resist * 0.5));
+        }
+        break;
+      case 'burn':
+        enemy.burnTimer = Math.max(enemy.burnTimer, actual);
+        if (strength !== undefined) {
+          enemy.burnDps = Math.max(enemy.burnDps, strength);
+        }
+        break;
+      case 'shock':
+        enemy.shockTimer = Math.max(enemy.shockTimer, actual);
+        break;
+      case 'stun':
+        enemy.stunTimer = Math.max(enemy.stunTimer, actual);
+        break;
+      case 'wither':
+        enemy.witheredTimer = Math.max(enemy.witheredTimer, actual);
+        break;
+    }
+    return actual;
   }
 
   private isPlayerLowLife(): boolean {
@@ -1978,6 +2178,10 @@ export class AshenEngine {
     if (skillId === 'meteor_brand' && prog.choices[10] === 'A') critChance += 0.1;
     if (skillId === 'tempest_nova' && prog.choices[10] === 'B') critChance += 0.1;
     if (isEclipseEmpowered && this.stats.activeMarks.includes('eclipse_core')) critChance += 0.15;
+    // Earthshaker (Seismic Slam Lv15 C) — +12% crit vs stunned
+    if (skillId === 'seismic_slam' && prog.choices[15] === 'C' && enemy.stunTimer > 0) {
+      critChance += 0.12;
+    }
 
     const isCrit = forceCrit || Math.random() < Math.min(0.95, critChance);
     const dist = Math.hypot(enemy.x - this.px, enemy.y - this.py);
@@ -2050,13 +2254,21 @@ export class AshenEngine {
 
     // Cold Chill
     if (skill.damageType === 'cold') {
-      enemy.chillTimer = 2.6;
-      enemy.chillStrength = Math.min(0.55, 0.25 * this.stats.chillEffectMult);
+      let chillStr = 0.25 * this.stats.chillEffectMult;
+      let chillDur = 2.6;
+      // Permafrost (Frost Lance Lv15 A) — heavy chill + frost DoT
+      if (skillId === 'frost_lance' && prog.choices[15] === 'A') {
+        chillStr = Math.min(0.7, chillStr * 1.6);
+        chillDur = 3.4;
+        const frostDps = Math.round(finalDmg * 0.18);
+        this.applyStatus(enemy, 'burn', 2.8, frostDps);
+      }
+      this.applyStatus(enemy, 'chill', chillDur, chillStr);
     }
     // Fire Burn scaling with Pyromancer Aspect
     if (skill.damageType === 'fire' && this.activeAspects.includes('pyromancer')) {
-      enemy.burnTimer = Math.max(enemy.burnTimer, 2.5);
-      enemy.burnDps = Math.max(enemy.burnDps, Math.round(finalDmg * 0.22 * this.stats.burnMagnitudeMult));
+      const burnDps = Math.round(finalDmg * 0.22 * this.stats.burnMagnitudeMult);
+      this.applyStatus(enemy, 'burn', 2.5, burnDps);
     }
 
     // Critical Momentum Mark
@@ -2084,17 +2296,43 @@ export class AshenEngine {
       isCrit ? '#D99B38' : DAMAGE_COLORS[skill.damageType],
       isCrit
     );
-    this.burstParticles(enemy.x, enemy.y, DAMAGE_COLORS[skill.damageType], isCrit ? 15 : 7, 'core');
+    this.burstDamageVfx(
+      enemy.x,
+      enemy.y,
+      skill.damageType,
+      isCrit ? 1.45 : 0.85
+    );
     if (isCrit || isEclipseEmpowered) {
       this.spawnCritStreak(enemy.x, enemy.y, DAMAGE_COLORS[skill.damageType], isEclipseEmpowered);
     }
     soundEngine.playHit(isCrit);
 
-    if (isCrit || (!enemy.isDummy && enemy.hp <= 0)) {
+    const killed = !enemy.isDummy && enemy.hp <= 0;
+    if (isCrit || killed) {
+      // Stronger hitstop on big crits / kills
       if (this.hitstopEnabled) {
-        this.hitstopTimer = Math.max(this.hitstopTimer, !enemy.isDummy && enemy.hp <= 0 ? 0.045 : 0.032);
+        let stop = isCrit ? 0.048 : 0.028;
+        if (killed) stop = Math.max(stop, 0.062);
+        // Extra freeze for chunky crits
+        if (isCrit && finalDmg >= 80) stop += 0.018;
+        if (isCrit && finalDmg >= 180) stop += 0.022;
+        this.hitstopTimer = Math.max(this.hitstopTimer, stop);
       }
-      this.addTrauma(!enemy.isDummy && enemy.hp <= 0 ? 0.22 : 0.16);
+      this.addTrauma(killed ? 0.28 : isCrit ? 0.2 : 0.14);
+
+      // Screen flash – gold on crit, white-red on kill
+      if (isCrit) {
+        this.screenFlash = Math.max(this.screenFlash, finalDmg >= 120 ? 0.72 : 0.48);
+        this.screenFlashColor = '#FDE68A';
+        const kick = finalDmg >= 180 ? 0.85 : finalDmg >= 80 ? 0.65 : 0.45;
+        this.fovKick = Math.max(this.fovKick, kick);
+        this.fovKickSign = 1; // zoom-in
+      } else if (killed) {
+        this.screenFlash = Math.max(this.screenFlash, 0.4);
+        this.screenFlashColor = '#FEE2E2';
+        this.fovKick = Math.max(this.fovKick, 0.55);
+        this.fovKickSign = 1;
+      }
     }
 
     if (!enemy.isDummy && enemy.hp <= 0 && enemy.koTimer === 0) {
@@ -2141,6 +2379,18 @@ export class AshenEngine {
     if (enemy.archetype === 'boss') {
       this.callbacks.onPinnacleBossKilled();
     }
+
+    // Relentless (Cinder Slash Lv15 C) — refund on kill
+    const cinderProg = this.skillProgress['cinder_slash'];
+    if (cinderProg?.choices[15] === 'C') {
+      const skill = SKILLS['cinder_slash'];
+      const refund = Math.round(skill.manaCost * 0.4);
+      if (this.stats.lifeCostsSkills) {
+        this.pHp = Math.min(this.stats.maxLife, this.pHp + refund);
+      } else {
+        this.pMp = Math.min(this.stats.maxMana, this.pMp + refund);
+      }
+    }
   }
 
   private grantPlayerXp(amount: number) {
@@ -2172,10 +2422,10 @@ export class AshenEngine {
     s.active = true;
     s.x = x;
     s.y = y;
-    s.width = chromatic ? 160 : 115;
+    s.width = chromatic ? 210 : 150;
     s.color = color;
-    s.maxLife = 0.22;
-    s.life = 0.22;
+    s.maxLife = chromatic ? 0.32 : 0.26;
+    s.life = s.maxLife;
     s.chromatic = chromatic;
   }
 
@@ -2201,6 +2451,105 @@ export class AshenEngine {
       p.size = layer === 'outer' ? 6 + Math.random() * 5 : 2 + Math.random() * 3;
       p.color = color;
       p.layer = layer;
+    }
+  }
+
+  /**
+   * Multi-layer, damage-type-specific impact VFX.
+   * Fire: rising embers + wide orange outer
+   * Cold: sharp radial shards + slow drift
+   * Lightning: long fast sparks
+   * Chaos/void: inward then outward purple pull
+   * Physical: tight bright core sparks
+   */
+  private burstDamageVfx(
+    x: number,
+    y: number,
+    damageType: DamageType,
+    intensity = 1
+  ) {
+    const n = (base: number) => Math.max(3, Math.round(base * intensity));
+    const color = DAMAGE_COLORS[damageType];
+
+    if (damageType === 'fire') {
+      // Hot core
+      for (let i = 0; i < n(8); i++) {
+        const p = this.particles[this.particleCursor];
+        this.particleCursor = (this.particleCursor + 1) % PARTICLE_POOL_SIZE;
+        const a = Math.random() * Math.PI * 2;
+        const spd = 50 + Math.random() * 120;
+        p.active = true;
+        p.x = x; p.y = y;
+        p.vx = Math.cos(a) * spd;
+        p.vy = Math.sin(a) * spd - 40; // rise
+        p.maxLife = 0.3 + Math.random() * 0.25;
+        p.life = p.maxLife;
+        p.size = 3 + Math.random() * 3;
+        p.color = Math.random() > 0.4 ? color : '#FDE68A';
+        p.layer = 'core';
+      }
+      // Smoky outer
+      this.burstParticles(x, y, '#9A3412', n(12), 'outer');
+      this.burstParticles(x, y, color, n(6), 'spark');
+    } else if (damageType === 'cold') {
+      // Ice shards – more directional, longer life
+      for (let i = 0; i < n(14); i++) {
+        const p = this.particles[this.particleCursor];
+        this.particleCursor = (this.particleCursor + 1) % PARTICLE_POOL_SIZE;
+        const a = Math.random() * Math.PI * 2;
+        const spd = 80 + Math.random() * 160;
+        p.active = true;
+        p.x = x; p.y = y;
+        p.vx = Math.cos(a) * spd;
+        p.vy = Math.sin(a) * spd;
+        p.maxLife = 0.35 + Math.random() * 0.3;
+        p.life = p.maxLife;
+        p.size = 2 + Math.random() * 2.5;
+        p.color = Math.random() > 0.5 ? color : '#E0F2FE';
+        p.layer = i % 2 === 0 ? 'spark' : 'core';
+      }
+      this.burstParticles(x, y, '#67E8F9', n(8), 'mid');
+    } else if (damageType === 'lightning') {
+      for (let i = 0; i < n(16); i++) {
+        const p = this.particles[this.particleCursor];
+        this.particleCursor = (this.particleCursor + 1) % PARTICLE_POOL_SIZE;
+        const a = Math.random() * Math.PI * 2;
+        const spd = 140 + Math.random() * 220;
+        p.active = true;
+        p.x = x; p.y = y;
+        p.vx = Math.cos(a) * spd;
+        p.vy = Math.sin(a) * spd;
+        p.maxLife = 0.12 + Math.random() * 0.18;
+        p.life = p.maxLife;
+        p.size = 1.5 + Math.random() * 2;
+        p.color = Math.random() > 0.35 ? color : '#F0F9FF';
+        p.layer = 'spark';
+      }
+      this.burstParticles(x, y, color, n(5), 'core');
+    } else if (damageType === 'chaos') {
+      // Inward void pull then residual sparks
+      for (let i = 0; i < n(12); i++) {
+        const p = this.particles[this.particleCursor];
+        this.particleCursor = (this.particleCursor + 1) % PARTICLE_POOL_SIZE;
+        const a = Math.random() * Math.PI * 2;
+        const dist = 30 + Math.random() * 50;
+        p.active = true;
+        p.x = x + Math.cos(a) * dist;
+        p.y = y + Math.sin(a) * dist;
+        p.vx = -Math.cos(a) * (60 + Math.random() * 80);
+        p.vy = -Math.sin(a) * (60 + Math.random() * 80);
+        p.maxLife = 0.28 + Math.random() * 0.22;
+        p.life = p.maxLife;
+        p.size = 3 + Math.random() * 4;
+        p.color = Math.random() > 0.4 ? color : '#6B21A8';
+        p.layer = 'outer';
+      }
+      this.burstParticles(x, y, '#E9D5FF', n(7), 'core');
+    } else {
+      // Physical – tight bright debris
+      this.burstParticles(x, y, color, n(10), 'core');
+      this.burstParticles(x, y, '#94A3B8', n(8), 'spark');
+      this.burstParticles(x, y, '#64748B', n(5), 'mid');
     }
   }
 
@@ -2231,19 +2580,27 @@ export class AshenEngine {
     const t = this.floatingTexts[this.textCursor];
     this.textCursor = (this.textCursor + 1) % FLOATING_TEXT_POOL_SIZE;
     t.active = true;
-    t.x = x;
-    t.y = y;
-    t.vy = isCrit ? -52 : -36;
+    // Slight random offset so stacked hits fan out
+    t.x = x + (Math.random() - 0.5) * (isCrit ? 18 : 12);
+    t.y = y + (Math.random() - 0.5) * 6;
+    t.vy = isCrit ? -68 : -42;
     t.text = text;
     t.color = color;
     t.isCrit = isCrit;
-    t.maxLife = isCrit ? 0.9 : 0.65;
+    t.maxLife = isCrit ? 1.15 : 0.72;
     t.life = t.maxLife;
   }
 
   private update(dt: number) {
     // Visual effects & shake tick even during hitstop or title idle
     this.trauma = Math.max(0, this.trauma - dt * 1.9);
+    if (this.screenFlash > 0) {
+      this.screenFlash = Math.max(0, this.screenFlash - dt * 3.8);
+    }
+    if (this.fovKick > 0) {
+      // Slightly slower than flash so zoom eases out smoothly
+      this.fovKick = Math.max(0, this.fovKick - dt * 2.8);
+    }
     for (const p of this.particles) {
       if (!p.active) continue;
       p.x += p.vx * dt;
@@ -2295,6 +2652,126 @@ export class AshenEngine {
     if (this.hitstopTimer > 0) {
       this.hitstopTimer = Math.max(0, this.hitstopTimer - dt);
       return;
+    }
+
+    // Twin Spin delayed cleave
+    if (this.twinSpinTimer > 0) {
+      this.twinSpinTimer = Math.max(0, this.twinSpinTimer - dt);
+      if (this.twinSpinTimer <= 0 && this.twinSpinParams) {
+        const p = this.twinSpinParams;
+        this.twinSpinParams = null;
+        // Second slash (slightly larger, different color tint)
+        this.slashEffects.push({
+          x: p.x,
+          y: p.y,
+          angle: p.angle,
+          arc: Math.PI * 2,
+          radius: p.radius * 1.08,
+          color: p.isEclipseEmpowered ? '#FBBF24' : '#F43F5E',
+          life: 0.26,
+          maxLife: 0.26,
+        });
+        // Extra blade trails
+        for (let i = 0; i <= 10; i++) {
+          const a = p.angle + (i / 10) * Math.PI * 2;
+          this.weaponTrail.push({
+            x: p.x + Math.cos(a) * p.radius * 0.85,
+            y: p.y + Math.sin(a) * p.radius * 0.85,
+            life: 0.18,
+            color: '#F43F5E',
+          });
+        }
+        this.damageEnemiesInRadius(
+          p.x,
+          p.y,
+          p.radius,
+          'crimson_whirlwind',
+          p.isShadeEmpowered,
+          p.isEclipseEmpowered,
+          false
+        );
+        this.burstParticles(p.x, p.y, '#F43F5E', 14, 'spark');
+        this.burstDamageVfx(p.x, p.y, 'physical', 0.7);
+        // Secondary shake — lighter than the first so it feels like a follow-through
+        this.addTrauma(0.12);
+      }
+    }
+
+    // Seismic Slam delayed (Aftershock / Double Rupture)
+    if (this.seismicDelayTimer > 0) {
+      this.seismicDelayTimer = Math.max(0, this.seismicDelayTimer - dt);
+      if (this.seismicDelayTimer <= 0 && this.seismicDelayParams) {
+        const p = this.seismicDelayParams;
+        this.seismicDelayParams = null;
+        this.slashEffects.push({
+          x: p.x,
+          y: p.y,
+          angle: 0,
+          arc: Math.PI * 2,
+          radius: p.radius,
+          color: p.isDoubleRupture ? '#CBD5E1' : '#94A3B8',
+          life: 0.3,
+          maxLife: 0.3,
+        });
+        this.spawnDecal(p.x, p.y, p.radius * 0.7, 2.2, '#64748B', 'crack');
+        this.damageEnemiesInRadius(
+          p.x,
+          p.y,
+          p.radius,
+          'seismic_slam',
+          p.isShadeEmpowered,
+          p.isEclipseEmpowered,
+          false,
+          p.damageMult
+        );
+        this.burstParticles(p.x, p.y, '#E2E8F0', 16, 'spark');
+        this.burstDamageVfx(p.x, p.y, 'physical', 0.6);
+        this.addTrauma(p.isDoubleRupture ? 0.22 : 0.14);
+      }
+    }
+
+    // Eclipse Cleave delayed slash
+    if (this.eclipseCleaveTimer > 0) {
+      this.eclipseCleaveTimer = Math.max(0, this.eclipseCleaveTimer - dt);
+      if (this.eclipseCleaveTimer <= 0 && this.eclipseCleaveParams) {
+        const p = this.eclipseCleaveParams;
+        this.eclipseCleaveParams = null;
+        this.slashEffects.push({
+          x: p.x,
+          y: p.y,
+          angle: p.angle,
+          arc: p.arc,
+          radius: p.radius,
+          color: p.isEclipseEmpowered ? '#FBBF24' : '#F97316',
+          life: 0.24,
+          maxLife: 0.24,
+        });
+        this.damageEnemiesInRadius(p.x, p.y, p.radius, 'cinder_slash', p.isShadeEmpowered, p.isEclipseEmpowered, false, 0.7);
+        this.burstDamageVfx(p.x, p.y, 'fire', 0.6);
+        this.addTrauma(0.1);
+      }
+    }
+
+    // Double Eruption delayed nova
+    if (this.doubleEruptionTimer > 0) {
+      this.doubleEruptionTimer = Math.max(0, this.doubleEruptionTimer - dt);
+      if (this.doubleEruptionTimer <= 0 && this.doubleEruptionParams) {
+        const p = this.doubleEruptionParams;
+        this.doubleEruptionParams = null;
+        this.slashEffects.push({
+          x: p.x,
+          y: p.y,
+          angle: 0,
+          arc: Math.PI * 2,
+          radius: p.radius,
+          color: p.isEclipseEmpowered ? '#FBBF24' : '#F97316',
+          life: 0.28,
+          maxLife: 0.28,
+        });
+        this.damageEnemiesInRadius(p.x, p.y, p.radius, 'ashen_nova', p.isShadeEmpowered, p.isEclipseEmpowered, false, 0.65);
+        this.burstDamageVfx(p.x, p.y, 'fire', 0.8);
+        this.addTrauma(0.16);
+      }
     }
 
     this.simTime += dt;
@@ -2504,12 +2981,27 @@ export class AshenEngine {
     }
 
     let moveSpeed = this.stats.movementSpeed;
-    if (this.pVeilShield > 0) moveSpeed *= 0.85; // Veil drawback
+    // Status resist reduces aspect movement drawbacks
+    const resist = Math.min(0.75, this.stats.statusResistPct / 100);
+    if (this.pVeilShield > 0) {
+      // Veil: -15% base, reduced by status resist
+      moveSpeed *= 1 - 0.15 * (1 - resist);
+    }
     if (this.fleetfootTimer > 0) moveSpeed *= 1.25;
-    // Chilling Ground modifier slows player slightly when standing on frost decals
+    // Frigid / Bastion drawbacks also mitigated
+    if (this.activeAspects.includes('frigid') && !this.stats.activeLegendaries.includes('crown_winter')) {
+      moveSpeed *= 1 - 0.08 * (1 - resist);
+    }
+    if (this.activeAspects.includes('bastion')) {
+      moveSpeed *= 1 - 0.10 * (1 - resist);
+    }
+    // Chilling Ground — slow reduced by status resistance
     for (const d of this.decals) {
       if (d.active && d.kind === 'frost' && Math.hypot(this.px - d.x, this.py - d.y) <= d.radius) {
-        moveSpeed *= 0.82;
+        // Base 18% slow, reduced by status resist (75% resist = ~4.5% slow)
+        const resist = Math.min(0.75, this.stats.statusResistPct / 100);
+        const slowFactor = 0.82 + 0.18 * resist; // 0.82 at 0%, 1.0 at 100%
+        moveSpeed *= slowFactor;
         break;
       }
     }
@@ -2555,6 +3047,13 @@ export class AshenEngine {
       if (!d.active) continue;
       d.life -= dt;
       if (d.life <= 0) {
+        // Void Collapse (Void Tendrils Lv15 B) — detonate on expiry
+        if (d.kind === 'void' && this.skillProgress['void_tendrils']?.choices[15] === 'B') {
+          this.burstDamageVfx(d.x, d.y, 'chaos', 1.3);
+          this.burstParticles(d.x, d.y, '#A855F7', 22, 'outer');
+          this.damageEnemiesInRadius(d.x, d.y, d.radius * 0.9, 'void_tendrils', false, false, false, 0.8);
+          this.addTrauma(0.18);
+        }
         d.active = false;
         continue;
       }
@@ -2568,10 +3067,16 @@ export class AshenEngine {
               if (Math.hypot(e.x - d.x, e.y - d.y) <= d.radius + e.radius) {
                 const tickDmg = Math.round(d.dps * 0.35);
                 e.hp -= tickDmg;
-                e.chillTimer = Math.max(e.chillTimer, 0.45);
-                e.chillStrength = Math.max(e.chillStrength, 0.28);
+                // Entropy Web (Void Tendrils Lv10 C) — 35% slow inside zone
+                const voidProg = this.skillProgress['void_tendrils'];
+                if (voidProg?.choices[10] === 'C') {
+                  this.applyStatus(e, 'chill', 0.6, 0.35);
+                } else {
+                  e.chillTimer = Math.max(e.chillTimer, 0.45);
+                  e.chillStrength = Math.max(e.chillStrength, 0.28);
+                }
                 if (this.stats.activeMarks.includes('withering_touch')) {
-                  e.witheredTimer = 2.0;
+                  this.applyStatus(e, 'wither', 2.0);
                 }
                 this.recentDamageDealt += tickDmg;
                 this.spawnFloatingText(e.x, e.y - 16, `${tickDmg}`, '#A855F7', false);
@@ -2663,6 +3168,12 @@ export class AshenEngine {
               returnMult
             );
 
+            // Inferno Burst (Ember Bolt Lv15 B) — strong burn on hit
+            if (pr.skillId === 'ember_bolt' && prog.choices[15] === 'B') {
+              const strongBurn = Math.round(28 + prog.level * 6) * this.stats.burnMagnitudeMult;
+              this.applyStatus(e, 'burn', 3.2, strongBurn);
+            }
+
             if (pr.explodeRadius) {
               this.burstParticles(pr.x, pr.y, '#F97316', 14, 'outer');
               this.damageEnemiesInRadius(pr.x, pr.y, pr.explodeRadius, pr.skillId, false, false, false);
@@ -2711,7 +3222,14 @@ export class AshenEngine {
       if (e.witheredTimer > 0) e.witheredTimer -= dt;
       if (e.burnTimer > 0) {
         e.burnTimer -= dt;
-        e.hp -= e.burnDps * dt;
+        const burnTick = e.burnDps * dt;
+        e.hp -= burnTick;
+        // Burn floating numbers (throttled)
+        this.burnTextTimer -= dt;
+        if (this.burnTextTimer <= 0 && burnTick > 2) {
+          this.burnTextTimer = 0.18;
+          this.spawnFloatingText(e.x, e.y - e.radius - 4, `${Math.round(burnTick * 4)}`, '#F97316', false);
+        }
         if (e.hp <= 0) {
           this.onEnemyKilled(e);
           continue;
@@ -3065,6 +3583,9 @@ export class AshenEngine {
     this.pEsRechargeDelay = 2.8;
     soundEngine.playPlayerHurt();
     this.addTrauma(0.28);
+    // Widen FOV briefly on player hurt (disorient)
+    this.fovKick = Math.max(this.fovKick, 0.4);
+    this.fovKickSign = -1;
 
     // Regrowth Aspect queues 3% of damage taken as regen
     if (this.activeAspects.includes('regrowth')) {
@@ -3874,6 +4395,10 @@ export class AshenEngine {
       simTime: this.simTime,
       hitstopTimer: this.hitstopTimer,
       trauma: this.screenShakeEnabled ? this.trauma : 0,
+      screenFlash: this.screenFlash,
+      screenFlashColor: this.screenFlashColor,
+      fovKick: this.fovKick,
+      fovKickSign: this.fovKickSign,
       highContrastTelegraphs: this.highContrastTelegraphs,
       inSanctuary: this.inSanctuary,
       roomIndex: this.currentRoomIdx,

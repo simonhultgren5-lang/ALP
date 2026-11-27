@@ -42,7 +42,7 @@ import {
 } from './types';
 
 const SIM_TO_3D = 0.03; // 100 sim px = 3.0 meters
-const PARTICLE_CAP = 480;
+const PARTICLE_CAP = 720;
 const PROJECTILE_POOL = 96;
 const DECAL_POOL = 48;
 const SLASH_POOL = 32;
@@ -125,6 +125,8 @@ export class AshenThreeEngine {
   // Camera damping
   private camTargetX = 0;
   private camTargetZ = 0;
+  private readonly baseFov = 42;
+  private currentFov = 42;
   private lastPointerClientX = 0;
   private lastPointerClientY = 0;
   private hasPointer = false;
@@ -188,6 +190,7 @@ export class AshenThreeEngine {
   // DOM overlay for crisp damage numbers & dummy/enemy bars
   private overlayEl: HTMLDivElement;
   private floatTextEls: HTMLDivElement[] = [];
+  private flashEl: HTMLDivElement;
   private enemyBarEls: Array<{
     root: HTMLDivElement;
     fill: HTMLDivElement;
@@ -318,14 +321,15 @@ export class AshenThreeEngine {
     this.moveMarkerMesh.visible = false;
     this.scene.add(this.moveMarkerMesh);
 
-    // 6. Initialize GPU-friendly VFX Pools
-    this.particleGeo = new THREE.OctahedronGeometry(0.14, 0);
+    // 6. Initialize GPU-friendly VFX Pools – improved soft particles
+    this.particleGeo = new THREE.CircleGeometry(0.5, 12); // soft circular base
     this.particleMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
-      opacity: 0.9,
+      opacity: 0.85,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
+      side: THREE.DoubleSide,
     });
     this.particleInstanced = new THREE.InstancedMesh(
       this.particleGeo,
@@ -475,16 +479,31 @@ export class AshenThreeEngine {
     this.overlayEl.style.overflow = 'hidden';
     this.mountEl.appendChild(this.overlayEl);
 
+    // Fullscreen crit/kill flash
+    this.flashEl = document.createElement('div');
+    this.flashEl.style.position = 'absolute';
+    this.flashEl.style.inset = '0';
+    this.flashEl.style.pointerEvents = 'none';
+    this.flashEl.style.opacity = '0';
+    this.flashEl.style.background =
+      'radial-gradient(ellipse at center, rgba(253,230,138,0.55) 0%, rgba(0,0,0,0) 70%)';
+    this.flashEl.style.mixBlendMode = 'screen';
+    this.flashEl.style.transition = 'opacity 40ms linear';
+    this.overlayEl.appendChild(this.flashEl);
+
     for (let i = 0; i < FLOATING_DOM_POOL; i++) {
       const el = document.createElement('div');
       el.style.position = 'absolute';
       el.style.left = '0';
       el.style.top = '0';
-      el.style.fontFamily = '"JetBrains Mono", monospace';
-      el.style.fontWeight = '700';
+      el.style.fontFamily = '"Cinzel", "JetBrains Mono", Georgia, serif';
+      el.style.fontWeight = '800';
       el.style.whiteSpace = 'nowrap';
-      el.style.textShadow = '0 1px 3px #000, 0 0 6px rgba(0,0,0,0.9)';
+      el.style.letterSpacing = '0.04em';
+      el.style.pointerEvents = 'none';
+      el.style.willChange = 'transform, opacity, filter';
       el.style.display = 'none';
+      el.style.transformOrigin = '50% 100%';
       this.overlayEl.appendChild(el);
       this.floatTextEls.push(el);
     }
@@ -850,16 +869,22 @@ export class AshenThreeEngine {
         s.player.scaleY,
         s.player.scaleX
       );
-      const intent: AnimIntent =
-        this.swingVisualTimer > 0.05
-          ? 'attack'
-          : speed > 10
-            ? 'move'
-            : 'idle';
-      this.playerCustomRig.setAnimationState(
-        intent,
-        intent === 'move' ? Math.max(0.85, speed / 210) : 1
-      );
+
+      // Hit-react takes priority for a short window
+      if (s.player.hitFlash > 0.12) {
+        this.playerCustomRig.playHitReact(Math.min(1.2, s.player.hitFlash));
+      } else {
+        const intent: AnimIntent =
+          this.swingVisualTimer > 0.05
+            ? 'attack'
+            : speed > 10
+              ? 'move'
+              : 'idle';
+        this.playerCustomRig.setAnimationState(
+          intent,
+          intent === 'move' ? Math.max(0.85, speed / 210) : 1
+        );
+      }
       this.playerCustomRig.update(dt);
       if (this.swingVisualTimer > 0) {
         this.swingVisualTimer = Math.max(0, this.swingVisualTimer - dt);
@@ -951,6 +976,32 @@ export class AshenThreeEngine {
       this.camTargetZ + camBack
     );
     this.camera.lookAt(this.camTargetX, 0.75, this.camTargetZ);
+
+    // Crit / kill screen flash
+    const flash = (s as { screenFlash?: number; screenFlashColor?: string }).screenFlash ?? 0;
+    if (flash > 0.01) {
+      const col = (s as { screenFlashColor?: string }).screenFlashColor ?? '#FDE68A';
+      this.flashEl.style.opacity = String(Math.min(0.85, flash));
+      this.flashEl.style.background =
+        `radial-gradient(ellipse at center, ${col}99 0%, ${col}33 35%, rgba(0,0,0,0) 72%)`;
+    } else {
+      this.flashEl.style.opacity = '0';
+    }
+
+    // FOV lerp – zoom-in on crit/kill, widen on player hurt
+    {
+      const kick = (s as { fovKick?: number }).fovKick ?? 0;
+      const sign = (s as { fovKickSign?: number }).fovKickSign ?? 1;
+      // Max ±4.5° from base
+      const targetFov = this.baseFov - sign * kick * 4.5;
+      // Exp lerp for smooth approach (faster catch-up when kick is fresh)
+      const lerpRate = kick > 0.2 ? 18 : 10;
+      this.currentFov += (targetFov - this.currentFov) * (1 - Math.exp(-lerpRate * dt));
+      if (Math.abs(this.camera.fov - this.currentFov) > 0.02) {
+        this.camera.fov = this.currentFov;
+        this.camera.updateProjectionMatrix();
+      }
+    }
 
     // 4. Sync Enemies & Telegraphs + Floating Enemy Bars
     const seenEnemyIds = new Set<number>();
@@ -1044,17 +1095,30 @@ export class AshenThreeEngine {
           e.scaleY * koScale * eliteBoost,
           e.scaleX * koScale * eliteBoost
         );
-        const enemyIntent: AnimIntent =
-          e.koTimer > 0
-            ? 'death'
-            : e.state === 'windup'
+        if (e.koTimer > 0) {
+          entry.customRig.playDeath();
+        } else if (e.hitFlash > 0.1) {
+          entry.customRig.playHitReact(Math.min(1.3, e.hitFlash * 1.1));
+        } else {
+          const enemyIntent: AnimIntent =
+            e.state === 'windup'
               ? 'windup'
               : e.state === 'attack'
                 ? 'attack'
                 : e.isDummy
                   ? 'idle'
                   : 'move';
-        entry.customRig.setAnimationState(enemyIntent, 1);
+          entry.customRig.setAnimationState(enemyIntent, 1);
+        }
+
+        // Procedural look-at player
+        entry.customRig.setLookAt(
+          new THREE.Vector3(
+            this.simToWorldX(s.player.x),
+            1.4,
+            this.simToWorldZ(s.player.y)
+          )
+        );
         entry.customRig.update(dt);
 
         if (e.hitFlash > 0) {
@@ -1276,22 +1340,28 @@ export class AshenThreeEngine {
       }
     }
 
-    // 10. Sync Instanced Additive Particles
+    // 10. Sync Instanced Additive Soft Particles (improved)
     let pCount = 0;
     for (let i = 0; i < s.particles.length && pCount < PARTICLE_CAP; i++) {
       const p = s.particles[i];
       if (!p.active) continue;
-      const alpha = Math.max(0.05, p.life / Math.max(0.01, p.maxLife));
-      const sz = (p.layer === 'outer' ? p.size * 0.08 : p.size * 0.05) * (0.4 + alpha * 0.8);
+      const lifeRatio = Math.max(0.02, p.life / Math.max(0.01, p.maxLife));
+      // Larger + softer for outer layer, tighter for core/spark
+      const base = p.layer === 'outer' ? p.size * 0.11 : p.layer === 'spark' ? p.size * 0.045 : p.size * 0.065;
+      const sz = base * (0.55 + lifeRatio * 1.15);
       this._vec3B.set(
         this.simToWorldX(p.x),
-        0.55 + (1 - alpha) * 0.9,
+        0.5 + (1 - lifeRatio) * 1.1,
         this.simToWorldZ(p.y)
       );
+      // Face camera (billboard-ish)
+      this._quat.copy(this.camera.quaternion);
       this._scale.set(sz, sz, sz);
       this._mat4.compose(this._vec3B, this._quat, this._scale);
       this.particleInstanced.setMatrixAt(pCount, this._mat4);
-      this._color.set(p.color).multiplyScalar(alpha);
+      // Brighter core, softer fade
+      const intensity = p.layer === 'outer' ? 0.55 + lifeRatio * 0.5 : 0.75 + lifeRatio * 0.6;
+      this._color.set(p.color).multiplyScalar(intensity);
       this.particleInstanced.setColorAt(pCount, this._color);
       pCount++;
     }
@@ -1303,18 +1373,22 @@ export class AshenThreeEngine {
       }
     }
 
-    // 11. Sync Anamorphic Crit Streaks (M3.3)
+    // 11. Sync Anamorphic Crit Streaks (M3.3) – brighter, longer flash
     let streakCursor = 0;
     for (const cs of s.critStreaks) {
       if (!cs.active || streakCursor >= STREAK_POOL) continue;
       const slot = this.streakPool[streakCursor++];
       const t = Math.max(0, cs.life / Math.max(0.01, cs.maxLife));
+      // Ease-out so the streak stays bright longer then snaps away
+      const bright = Math.pow(t, 0.55);
       slot.mesh.visible = true;
-      slot.mesh.position.set(this.simToWorldX(cs.x), 1.05, this.simToWorldZ(cs.y));
+      slot.mesh.position.set(this.simToWorldX(cs.x), 1.15, this.simToWorldZ(cs.y));
       slot.mesh.quaternion.copy(this.camera.quaternion);
-      slot.mesh.scale.set(cs.width * SIM_TO_3D * (1.2 - t * 0.35), 1, 1);
+      const w = cs.width * SIM_TO_3D * (1.55 - t * 0.4);
+      const h = 0.55 + bright * 0.85;
+      slot.mesh.scale.set(w, h, 1);
       slot.mat.color.set(cs.color);
-      slot.mat.opacity = t * 0.95;
+      slot.mat.opacity = bright * 0.98;
     }
     for (let i = streakCursor; i < STREAK_POOL; i++) {
       this.streakPool[i].mesh.visible = false;
@@ -1378,23 +1452,75 @@ export class AshenThreeEngine {
       }
     }
 
-    // 13. Sync Floating Damage Numbers in DOM Overlay
+    // 13. Sync Floating Damage Numbers in DOM Overlay (enhanced)
     let textCursor = 0;
     for (const f of s.floatingTexts) {
       if (!f.active || textCursor >= FLOATING_DOM_POOL) continue;
+      const lifeT = f.life / Math.max(0.01, f.maxLife); // 1 → 0
+      const ageT = 1 - lifeT; // 0 → 1
+
+      // Rise + slight arc
+      const rise = ageT * (f.isCrit ? 1.55 : 1.15);
       this._vec3
-        .set(this.simToWorldX(f.x), 1.65 + (1 - f.life / Math.max(0.01, f.maxLife)) * 1.1, this.simToWorldZ(f.y))
+        .set(
+          this.simToWorldX(f.x),
+          1.55 + rise,
+          this.simToWorldZ(f.y)
+        )
         .project(this.camera);
       if (this._vec3.z >= 1) continue;
       const sx = (this._vec3.x * 0.5 + 0.5) * canvasW;
       const sy = (-this._vec3.y * 0.5 + 0.5) * canvasH;
+
+      // Scale punch: crit pops big then settles, normal is subtler
+      let scale: number;
+      if (f.isCrit) {
+        // Quick overshoot then ease down
+        scale = ageT < 0.12
+          ? 0.7 + (ageT / 0.12) * 1.1   // 0.7 → 1.8
+          : 1.8 - Math.min(0.55, (ageT - 0.12) * 0.9);
+      } else {
+        scale = ageT < 0.08 ? 0.85 + (ageT / 0.08) * 0.25 : 1.05 - ageT * 0.12;
+      }
+
+      // Fade: hold then soft out
+      const opacity = ageT < 0.55
+        ? Math.min(1, 0.35 + ageT * 2.2)
+        : Math.max(0, (1 - ageT) / 0.45);
+
+      // Drift sideways a bit based on text hash for less stacking
+      const drift = ((f.text.length * 17 + Math.floor(f.x)) % 11) - 5;
+
       const el = this.floatTextEls[textCursor++];
       el.style.display = 'block';
-      el.textContent = f.text;
-      el.style.color = f.color;
-      el.style.fontSize = f.isCrit ? '16px' : '12px';
-      el.style.opacity = String(Math.min(1, (f.life / Math.max(0.01, f.maxLife)) * 1.4));
-      el.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
+
+      if (f.isCrit) {
+        el.innerHTML = `<span style="font-size:0.62em;opacity:0.95;letter-spacing:0.14em;margin-right:4px">CRIT</span>${f.text}`;
+        el.style.fontSize = '22px';
+        el.style.color = '#FFF7ED';
+        el.style.background = 'linear-gradient(180deg, #FEF3C7 0%, #FBBF24 40%, #F59E0B 100%)';
+        el.style.webkitBackgroundClip = 'text';
+        el.style.backgroundClip = 'text';
+        (el.style as CSSStyleDeclaration & { webkitTextFillColor?: string }).webkitTextFillColor = 'transparent';
+        el.style.filter =
+          'drop-shadow(0 0 6px rgba(251,191,36,0.95)) drop-shadow(0 0 14px rgba(245,158,11,0.65)) drop-shadow(0 2px 3px #000)';
+        el.style.textShadow = 'none';
+      } else {
+        el.textContent = f.text;
+        el.style.fontSize = '14px';
+        el.style.color = f.color;
+        el.style.background = 'none';
+        el.style.webkitBackgroundClip = 'unset';
+        el.style.backgroundClip = 'unset';
+        (el.style as CSSStyleDeclaration & { webkitTextFillColor?: string }).webkitTextFillColor = '';
+        el.style.filter = 'none';
+        el.style.textShadow =
+          `0 0 8px ${f.color}aa, 0 1px 2px #000, 0 0 3px #000`;
+      }
+
+      el.style.opacity = String(opacity);
+      el.style.transform =
+        `translate3d(${(sx + drift).toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%) scale(${scale.toFixed(3)})`;
     }
     for (let i = textCursor; i < FLOATING_DOM_POOL; i++) {
       this.floatTextEls[i].style.display = 'none';
